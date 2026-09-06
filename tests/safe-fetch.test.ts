@@ -1,6 +1,17 @@
 import { describe, expect, it } from "vitest";
 
-import { safeFetch, SafeFetchError, safeFetchText } from "../src/http/safe-fetch.js";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+
+import {
+  createPinnedDispatcher,
+  defaultFetch,
+  safeFetch,
+  SafeFetchError,
+  pinnedLookup,
+  safeFetchText,
+} from "../src/http/safe-fetch.js";
+import { isBlockedAddress } from "../src/http/url-guard.js";
 
 const PUBLIC_DNS = () => Promise.resolve(["93.184.216.34"]);
 const BASE = { maxBytes: 1_000_000, timeoutMs: 5_000 };
@@ -251,5 +262,200 @@ describe("safeFetch — host allowlist", () => {
         { fetch: script.fetch, resolveHost: PUBLIC_DNS },
       ),
     ).rejects.toMatchObject({ reason: "host_not_allowed" });
+  });
+});
+
+describe("address classification", () => {
+  const blocked = [
+    "127.0.0.1",
+    "10.0.0.5",
+    "172.16.0.1",
+    "192.168.1.1",
+    "169.254.169.254",
+    "100.64.0.1",
+    "0.0.0.0",
+    "224.0.0.1",
+    "::1",
+    "fe80::1",
+    "fc00::1",
+    "ff02::1",
+    // The three the reviewer identified as missing:
+    "::ffff:127.0.0.1",
+    "::ffff:10.1.2.3",
+    "2001:db8::1",
+  ];
+
+  it.each(blocked)("refuses %s", (address) => {
+    expect(isBlockedAddress(address)).toBe(true);
+  });
+
+  it.each(["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946", "8.8.8.8"])(
+    "allows public address %s",
+    (address) => {
+      expect(isBlockedAddress(address)).toBe(false);
+    },
+  );
+
+  it("refuses names that always mean this machine", () => {
+    expect(isBlockedAddress("localhost")).toBe(true);
+    expect(isBlockedAddress("db.local")).toBe(true);
+    expect(isBlockedAddress("")).toBe(true);
+  });
+
+  it("refuses an IPv4-mapped IPv6 literal in a URL", async () => {
+    const script = scriptedFetch({});
+    await expect(
+      safeFetch("http://[::ffff:127.0.0.1]/x", BASE, {
+        fetch: script.fetch,
+        resolveHost: PUBLIC_DNS,
+      }),
+    ).rejects.toMatchObject({ reason: "blocked_host" });
+    expect(script.requested).toEqual([]);
+  });
+
+  it("refuses a redirect to an IPv4-mapped IPv6 address", async () => {
+    const script = scriptedFetch({
+      "https://feeds.example.com/a.xml": redirectTo("http://[::ffff:169.254.169.254]/meta"),
+    });
+    await expect(
+      safeFetch("https://feeds.example.com/a.xml", BASE, {
+        fetch: script.fetch,
+        resolveHost: PUBLIC_DNS,
+      }),
+    ).rejects.toMatchObject({ reason: "blocked_host" });
+    expect(script.requested).toHaveLength(1);
+  });
+});
+
+describe("connection pinning (DNS rebinding)", () => {
+  it("connects using the exact address that was vetted", async () => {
+    const pinned: string[] = [];
+    const script = scriptedFetch({
+      "https://rebind.example.com/x": () => new Response("ok", { status: 200 }),
+    });
+
+    await safeFetchText("https://rebind.example.com/x", BASE, {
+      fetch: script.fetch,
+      resolveHost: () => Promise.resolve(["93.184.216.34"]),
+      createDispatcher: (address) => {
+        pinned.push(address);
+        return undefined as never;
+      },
+    });
+
+    // The connection is pinned to the vetted answer, not re-resolved by fetch.
+    expect(pinned).toEqual(["93.184.216.34"]);
+  });
+
+  it("pins each redirect hop to its own vetted address", async () => {
+    const pinned: string[] = [];
+    const byHost: Record<string, string> = {
+      "first.example.com": "93.184.216.34",
+      "second.example.com": "8.8.8.8",
+    };
+    const script = scriptedFetch({
+      "https://first.example.com/a": redirectTo("https://second.example.com/b"),
+      "https://second.example.com/b": () => new Response("ok", { status: 200 }),
+    });
+
+    await safeFetchText("https://first.example.com/a", BASE, {
+      fetch: script.fetch,
+      resolveHost: (hostname) => Promise.resolve([byHost[hostname] ?? "1.1.1.1"]),
+      createDispatcher: (address) => {
+        pinned.push(address);
+        return undefined as never;
+      },
+    });
+
+    expect(pinned).toEqual(["93.184.216.34", "8.8.8.8"]);
+  });
+
+  it("uses a literal address directly without resolving it", async () => {
+    const pinned: string[] = [];
+    const script = scriptedFetch({
+      "https://93.184.216.34/x": () => new Response("ok", { status: 200 }),
+    });
+
+    await safeFetchText("https://93.184.216.34/x", BASE, {
+      fetch: script.fetch,
+      resolveHost: () => Promise.reject(new Error("DNS must not be consulted for a literal")),
+      createDispatcher: (address) => {
+        pinned.push(address);
+        return undefined as never;
+      },
+    });
+
+    expect(pinned).toEqual(["93.184.216.34"]);
+  });
+});
+
+describe("pinnedLookup", () => {
+  it("answers with the pinned address whatever hostname is asked for", () => {
+    const lookup = pinnedLookup("93.184.216.34");
+    let seen: unknown;
+    lookup("evil.example.com", {}, (_error, address) => {
+      seen = address;
+    });
+    expect(seen).toBe("93.184.216.34");
+  });
+
+  it("answers the all:true form with the same single address", () => {
+    const lookup = pinnedLookup("93.184.216.34");
+    let seen: unknown;
+    lookup("evil.example.com", { all: true }, (_error, address) => {
+      seen = address;
+    });
+    expect(seen).toEqual([{ address: "93.184.216.34", family: 4 }]);
+  });
+
+  it("reports an error rather than passing through a non-address", () => {
+    const lookup = pinnedLookup("not-an-ip");
+    let error: Error | null = null;
+    lookup("evil.example.com", {}, (caught) => {
+      error = caught;
+    });
+    expect(error).toBeInstanceOf(Error);
+  });
+
+  it("builds a usable dispatcher", async () => {
+    const dispatcher = createPinnedDispatcher("93.184.216.34");
+    expect(dispatcher).toBeDefined();
+    await dispatcher.close();
+  });
+});
+
+describe("pinned connection against a real socket", () => {
+  it("connects to the pinned address for a hostname that does not resolve", async () => {
+    // Proves the pinned address is what the connection actually uses: DNS could
+    // never resolve "pinned.invalid", yet the request reaches the local server.
+    const seenHosts: string[] = [];
+    const server = createServer((req, res) => {
+      seenHosts.push(req.headers.host ?? "");
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("reached");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+
+    const dispatcher = createPinnedDispatcher("127.0.0.1");
+    try {
+      const response = await defaultFetch(`http://pinned.invalid:${port}/`, {
+        dispatcher,
+      } as RequestInit);
+
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("reached");
+      // The original hostname is still sent, so TLS SNI and Host are unaffected.
+      expect(seenHosts[0]).toBe(`pinned.invalid:${port}`);
+    } finally {
+      await dispatcher.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }, 30_000);
+
+  it("defaultFetch is undici's, which is what accepts the pinning dispatcher", () => {
+    // Node's global fetch is a separate internal undici copy and rejects a
+    // dispatcher from the undici package; production must not use it here.
+    expect(defaultFetch).not.toBe(globalThis.fetch);
   });
 });

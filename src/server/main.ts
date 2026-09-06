@@ -1,3 +1,4 @@
+import { defaultFetch } from "../http/safe-fetch.js";
 import { createApp } from "./app.js";
 import { FixtureSummarizer } from "../summary/fixture-summarizer.js";
 import { FixtureTranscriptionAdapter } from "../transcription/fixture-adapter.js";
@@ -13,7 +14,8 @@ const port = Number(process.env.PORT ?? 10_000);
 
 const app = createApp({
   deps: {
-    fetch,
+    // Not the global fetch: address pinning requires undici's own. See defaultFetch.
+    fetch: defaultFetch,
     transcription: new FixtureTranscriptionAdapter("[transcription provider not configured]"),
     summarizer: new FixtureSummarizer({
       summary: "[summary provider not configured]",

@@ -1,14 +1,4 @@
-/**
- * Outbound URL guard for server-side fetching (SSRF protection).
- *
- * The server follows URLs that come from Spotify pages and third-party RSS
- * feeds, so every one is untrusted input. This refuses non-HTTP schemes,
- * credentials in the URL, and hosts that resolve to private or reserved
- * address space by literal.
- *
- * This checks the URL itself. Hostnames that resolve to private addresses are
- * caught by `safeFetch`, which resolves every hop before connecting.
- */
+import ipaddr from "ipaddr.js";
 
 export type UrlRejection =
   | "not_a_url"
@@ -19,54 +9,56 @@ export type UrlRejection =
 
 export type UrlCheck = { ok: true; url: URL } | { ok: false; reason: UrlRejection };
 
-function parseIpv4(host: string): number[] | null {
-  const parts = host.split(".");
-  if (parts.length !== 4) return null;
-  const octets = parts.map((part) => (/^\d{1,3}$/.test(part) ? Number(part) : Number.NaN));
-  return octets.every((n) => Number.isInteger(n) && n >= 0 && n <= 255) ? octets : null;
-}
+/**
+ * The only address class we will connect to.
+ *
+ * An allowlist rather than a blocklist: `ipaddr.js` classifies every other
+ * range as loopback, private, linkLocal, uniqueLocal, carrierGradeNat,
+ * multicast, reserved, unspecified, broadcast, 6to4, teredo and so on, and a
+ * range we fail to anticipate should be refused rather than dialled. This
+ * replaced hand-written regexes that missed IPv4-mapped IPv6
+ * (`::ffff:127.0.0.1`), the IPv6 documentation range (`2001:db8::/32`) and
+ * IPv6 multicast.
+ */
+const ALLOWED_RANGE = "unicast";
 
-/** Private, loopback, link-local, CGNAT, documentation, and multicast ranges. */
-function isBlockedIpv4(host: string): boolean {
-  const octets = parseIpv4(host);
-  if (!octets) return false;
-  const [a = 0, b = 0, c = 0] = octets;
-  return (
-    a === 0 ||
-    a === 10 ||
-    a === 127 ||
-    (a === 100 && b >= 64 && b <= 127) ||
-    (a === 169 && b === 254) ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) ||
-    (a === 192 && b === 0 && (c === 0 || c === 2)) ||
-    (a === 198 && (b === 18 || b === 19)) ||
-    (a === 198 && b === 51 && c === 100) ||
-    (a === 203 && b === 0 && c === 113) ||
-    a >= 224
-  );
+/** Names that always mean the local machine, whatever DNS says. */
+function isLocalName(host: string): boolean {
+  return host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local");
 }
 
 /**
- * True for loopback, private, link-local, CGNAT, documentation, benchmark and
- * multicast addresses, and for names that always mean "this machine".
+ * True for any address we refuse to connect to.
  *
- * Exported so `safeFetch` can apply the identical rule to resolved addresses;
- * a second implementation would drift from this one.
+ * Accepts a hostname or a literal address. A hostname that is not an IP
+ * literal is not judged here; `safeFetch` resolves it and applies this same
+ * function to every resolved address.
+ *
+ * Exported so `safeFetch` uses the identical rule; a second implementation
+ * would drift from this one.
  */
 export function isBlockedAddress(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
-  if (host === "::1" || host === "::") return true;
-  // Unique-local (fc00::/7) and link-local (fe80::/10) IPv6.
-  if (/^f[cd][0-9a-f]{2}:/i.test(host)) return true;
-  if (/^fe[89ab][0-9a-f]:/i.test(host)) return true;
-  return isBlockedIpv4(host);
+  if (!host) return true;
+  if (isLocalName(host)) return true;
+
+  if (!ipaddr.isValid(host)) return false;
+
+  let parsed = ipaddr.parse(host);
+  // `::ffff:127.0.0.1` is loopback wearing an IPv6 costume; judge the address
+  // it actually carries.
+  if (parsed.kind() === "ipv6") {
+    const asV6 = parsed as ipaddr.IPv6;
+    if (asV6.isIPv4MappedAddress()) parsed = asV6.toIPv4Address();
+  }
+  return parsed.range() !== ALLOWED_RANGE;
 }
 
 /**
- * Check an outbound URL. When `allowedHosts` is given, the host must match one
- * of them exactly or be a subdomain of one.
+ * Check an outbound URL's shape and any literal address it carries.
+ *
+ * When `allowedHosts` is given, the host must equal one of them or be a
+ * subdomain of one.
  */
 export function checkOutboundUrl(raw: string, allowedHosts?: readonly string[]): UrlCheck {
   let url: URL;

@@ -17,13 +17,18 @@ export interface ChunkedTranscript {
 }
 
 export interface TranscribeAudioOptions {
-  durationSeconds?: number | null;
   chunkSeconds?: number;
   onProgress?: (done: number, total: number) => void;
 }
 
 /**
  * Transcribe a local audio file, splitting it when it is long.
+ *
+ * The duration is always probed from the downloaded file. The feed's declared
+ * duration is publisher-controlled input: a feed claiming five minutes for a
+ * three-hour file would otherwise slip past the length limit and skip the
+ * chunking that keeps requests within provider limits. Feed duration stays
+ * evidence for matching and display only.
  *
  * Chunks are transcribed sequentially and joined by chunk index. Order is taken
  * from the index parsed out of each chunk's name, never from directory listing
@@ -38,7 +43,7 @@ export async function transcribeAudioFile(
   adapter: TranscriptionAdapter,
   options: TranscribeAudioOptions = {},
 ): Promise<ChunkedTranscript> {
-  const duration = options.durationSeconds ?? (await tool.probeDurationSeconds(audioPath));
+  const duration = await tool.probeDurationSeconds(audioPath);
   assertDurationWithinLimit(duration);
 
   if (!needsSplitting(duration, options.chunkSeconds)) {

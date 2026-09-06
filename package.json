@@ -22,5 +22,9 @@
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.18.1",
     "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "ipaddr.js": "^2.5.0",
+    "undici": "^8.10.2"
   }
 }

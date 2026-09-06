@@ -97,8 +97,9 @@ async function obtainTranscript(
 
       deps.onPhase?.("transcribing");
       const tool = deps.audioTool ?? new FfmpegAudioTool();
+      // No declared duration is passed: length enforcement and chunking are
+      // decided from the probed file, never from feed metadata.
       return transcribeAudioFile(audio.path, workspace, tool, deps.transcription, {
-        durationSeconds: evidence.durationSeconds,
         onProgress: (done, total) => deps.onPhase?.("transcribing", done, total),
       });
     });

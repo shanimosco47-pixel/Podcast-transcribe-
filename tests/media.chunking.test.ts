@@ -4,7 +4,12 @@ import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
 
-import { FfmpegAudioTool, type AudioChunk, type AudioTool } from "../src/media/ffmpeg.js";
+import {
+  FfmpegAudioTool,
+  FfmpegTimeoutError,
+  type AudioChunk,
+  type AudioTool,
+} from "../src/media/ffmpeg.js";
 import { transcribeAudioFile } from "../src/media/transcribe-audio.js";
 import { withWorkspace, Workspace } from "../src/media/workspace.js";
 import type { TranscriptionAdapter, TranscriptionRequest } from "../src/transcription/types.js";
@@ -52,7 +57,6 @@ describe.skipIf(!ffmpegAvailable)("splitting real audio with ffmpeg", () => {
 
       const adapter = new NamingAdapter((path) => `part:${path.match(/chunk-(\d+)/)?.[1] ?? "?"}`);
       const result = await transcribeAudioFile(source, workspace, tool, adapter, {
-        durationSeconds: duration,
         chunkSeconds: 5,
       });
 
@@ -158,4 +162,95 @@ describe("chunk ordering without ffmpeg", () => {
       await workspace.dispose();
     }
   });
+});
+
+describe("duration is enforced from the file, not the feed", () => {
+  /** Reports a long file regardless of what a feed claimed. */
+  function lyingFeedTool(probedSeconds: number): AudioTool {
+    return {
+      probeDurationSeconds: () => Promise.resolve(probedSeconds),
+      split: () => Promise.reject(new Error("split must not be reached")),
+    };
+  }
+
+  it("refuses a file whose probed duration exceeds the limit even when the feed declared it short", async () => {
+    const workspace = await Workspace.create();
+    try {
+      const adapter = new NamingAdapter(() => "x");
+      // The feed said five minutes; the actual media is five hours.
+      await expect(
+        transcribeAudioFile("/tmp/audio.mp3", workspace, lyingFeedTool(5 * 60 * 60), adapter),
+      ).rejects.toThrow(/over the/i);
+
+      // Nothing was sent to the provider.
+      expect(adapter.calls).toHaveLength(0);
+    } finally {
+      await workspace.dispose();
+    }
+  });
+
+  it("splits according to the probed duration when the feed understated it", async () => {
+    const workspace = await Workspace.create();
+    let splitCalled = false;
+    const tool: AudioTool = {
+      // Feed claimed 5 minutes; the file is really 30, so it must be split.
+      probeDurationSeconds: () => Promise.resolve(1800),
+      split: (_path, ws) => {
+        splitCalled = true;
+        return Promise.resolve(
+          [0, 1, 2].map((index) => ({
+            index,
+            path: ws.path(`chunk-${String(index).padStart(5, "0")}.mp3`),
+            startSeconds: index * 600,
+          })),
+        );
+      },
+    };
+
+    try {
+      const adapter = new NamingAdapter((path) => `part:${path.match(/chunk-(\d+)/)?.[1] ?? "?"}`);
+      const result = await transcribeAudioFile("/tmp/audio.mp3", workspace, tool, adapter);
+
+      expect(splitCalled).toBe(true);
+      expect(result.chunkCount).toBe(3);
+      expect(result.order).toEqual([0, 1, 2]);
+    } finally {
+      await workspace.dispose();
+    }
+  });
+});
+
+describe.skipIf(!ffmpegAvailable)("subprocess timeouts", () => {
+  it("terminates ffmpeg that outlives its timeout instead of holding the worker", async () => {
+    await withWorkspace(async (workspace) => {
+      const source = workspace.path("long.mp3");
+      await run("ffmpeg", [
+        "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=90",
+        "-acodec", "libmp3lame", source,
+      ]);
+
+      // 1 ms is unreachable for a real encode, so the kill path is what runs.
+      const impatient = new FfmpegAudioTool("ffmpeg", "ffprobe", 60_000, 1);
+      const started = Date.now();
+      await expect(impatient.split(source, workspace, 5)).rejects.toThrow(FfmpegTimeoutError);
+
+      // It returned promptly rather than running to completion.
+      expect(Date.now() - started).toBeLessThan(30_000);
+    });
+  }, 120_000);
+
+  it("terminates ffprobe that outlives its timeout", async () => {
+    await withWorkspace(async (workspace) => {
+      const source = workspace.path("probe.mp3");
+      await run("ffmpeg", [
+        "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=5",
+        "-acodec", "libmp3lame", source,
+      ]);
+
+      const impatient = new FfmpegAudioTool("ffmpeg", "ffprobe", 1, 60_000);
+      await expect(impatient.probeDurationSeconds(source)).rejects.toThrow(FfmpegTimeoutError);
+    });
+  }, 120_000);
 });

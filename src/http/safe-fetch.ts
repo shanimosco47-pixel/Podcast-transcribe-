@@ -1,4 +1,7 @@
+import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
+
+import { Agent, fetch as undiciFetch, type Dispatcher } from "undici";
 
 import { checkOutboundUrl, isBlockedAddress, type UrlRejection } from "./url-guard.js";
 
@@ -32,10 +35,63 @@ export interface SafeFetchOptions {
   accept?: string;
 }
 
+/**
+ * The fetch implementation production must use.
+ *
+ * Address pinning passes a `dispatcher` built from the `undici` package, and
+ * Node's *global* fetch is a different, internal copy of undici that rejects it
+ * with "invalid onRequestStart method" — verified, not assumed. Both must come
+ * from the same undici, so the app fetches through this rather than the global.
+ */
+export const defaultFetch = undiciFetch as unknown as typeof fetch;
+
 export interface SafeFetchDeps {
   fetch: typeof fetch;
   /** Injectable so tests can simulate a hostname that resolves to a private address. */
   resolveHost?: (hostname: string) => Promise<string[]>;
+  /**
+   * Builds the dispatcher that pins a connection to an already-vetted address.
+   * Injectable so tests can observe which address the connection would use.
+   */
+  createDispatcher?: (address: string) => Dispatcher;
+}
+
+/**
+ * A dispatcher whose DNS lookup always answers with `address`.
+ *
+ * Without this, `safeFetch` validates the name and then hands the *name* to
+ * fetch, which resolves it a second time. Between those two resolutions the
+ * answer can change, so a host that passed validation as a public address can
+ * be connected to as `127.0.0.1` — classic DNS rebinding, and a plain
+ * time-of-check/time-of-use gap. Pinning the vetted address closes it. The URL
+ * still carries the hostname, so SNI, certificate validation and the Host
+ * header are unaffected.
+ */
+export function createPinnedDispatcher(address: string): Dispatcher {
+  return new Agent({ connect: { lookup: pinnedLookup(address) } });
+}
+
+type LookupCallback = (error: Error | null, address: never, family?: never) => void;
+
+/**
+ * A `dns.lookup`-shaped function that ignores the hostname and always answers
+ * with `address`. Exported so the pinning behaviour is directly testable.
+ */
+export function pinnedLookup(
+  address: string,
+): (hostname: string, options: { all?: boolean | undefined }, callback: LookupCallback) => void {
+  return (_hostname, options, callback) => {
+    const family = isIP(address);
+    if (family === 0) {
+      callback(new Error(`Pinned address is not an IP: ${address}`), "" as never);
+      return;
+    }
+    if (options.all === true) {
+      callback(null, [{ address, family }] as never);
+      return;
+    }
+    callback(null, address as never, family as never);
+  };
 }
 
 const DEFAULT_MAX_REDIRECTS = 5;
@@ -121,9 +177,9 @@ export async function safeFetchStream(
     if (!check.ok) {
       throw new SafeFetchError(check.reason, `Refused ${redact(current)}: ${check.reason}`);
     }
-    await assertHostResolvesPublicly(check.url.hostname, resolveHost);
+    const vettedAddress = await assertHostResolvesPublicly(check.url.hostname, resolveHost);
 
-    const response = await requestWithTimeout(check.url, options, deps);
+    const response = await requestWithTimeout(check.url, vettedAddress, options, deps);
 
     if (isRedirect(response.status)) {
       const location = response.headers.get("location");
@@ -162,10 +218,14 @@ export async function safeFetchStream(
   );
 }
 
+/** Validates every resolved address and returns the one the connection must use. */
 async function assertHostResolvesPublicly(
   hostname: string,
   resolveHost: (hostname: string) => Promise<string[]>,
-): Promise<void> {
+): Promise<string> {
+  // A literal address needs no resolution; checkOutboundUrl already judged it.
+  if (isIP(hostname) !== 0) return hostname;
+
   let addresses: string[];
   try {
     addresses = await resolveHost(hostname);
@@ -186,19 +246,27 @@ async function assertHostResolvesPublicly(
       );
     }
   }
+  // The first vetted answer is the one pinned for the connection, so the
+  // address used is always one this function actually checked.
+  return addresses[0] as string;
 }
 
 async function requestWithTimeout(
   url: URL,
+  vettedAddress: string,
   options: SafeFetchOptions,
   deps: SafeFetchDeps,
 ): Promise<Response> {
   try {
-    const init: RequestInit = {
+    const init: RequestInit & { dispatcher?: Dispatcher } = {
       redirect: "manual",
       signal: AbortSignal.timeout(options.timeoutMs),
     };
     if (options.accept) init.headers = { accept: options.accept };
+
+    const makeDispatcher = deps.createDispatcher ?? createPinnedDispatcher;
+    init.dispatcher = makeDispatcher(vettedAddress);
+
     return await deps.fetch(url.toString(), init);
   } catch (error) {
     if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
