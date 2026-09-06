@@ -1,0 +1,17 @@
+{
+  "resultCount": 2,
+  "results": [
+    {
+      "wrapperType": "track",
+      "kind": "podcast",
+      "collectionName": "עושים טכנולוגיה",
+      "feedUrl": "https://feeds.example.com/osim-technologia.xml"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "podcast",
+      "collectionName": "עושים היסטוריה",
+      "feedUrl": "https://feeds.example.com/osim-historia.xml"
+    }
+  ]
+}

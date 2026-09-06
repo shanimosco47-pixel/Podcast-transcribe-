@@ -1,0 +1,11 @@
+{
+  "resultCount": 1,
+  "results": [
+    {
+      "wrapperType": "track",
+      "kind": "podcast",
+      "collectionName": "משהו אחר לגמרי",
+      "feedUrl": "https://feeds.example.com/other.xml"
+    }
+  ]
+}
