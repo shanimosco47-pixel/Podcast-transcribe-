@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { feedEpisodes } from "../src/matching/feed.js";
-import { matchEpisode } from "../src/matching/match.js";
+import { matchEpisode, scoreCandidate } from "../src/matching/match.js";
 import type { EpisodeCandidate } from "../src/matching/types.js";
 
 const feedXml = readFileSync(fileURLToPath(new URL("./fixtures/hebrew-feed.xml", import.meta.url)), "utf8");
@@ -125,5 +125,77 @@ describe("matchEpisode — signal contribution", () => {
     expect(result.status).toBe("matched");
     if (result.status !== "matched") return;
     expect(result.best.candidate.id).toBe("new");
+  });
+});
+
+describe("matchEpisode — asymmetric metadata availability", () => {
+  const query = {
+    episodeTitle: "ריאיון עם יואב",
+    showTitle: "עושים טכנולוגיה",
+    durationSeconds: 2335,
+    publishedAt: "2025-06-09T03:00:00Z",
+  };
+  /** Exact short title, but supplies neither duration nor publication date. */
+  const sparseWrong: EpisodeCandidate = {
+    id: "sparse-wrong",
+    title: "ריאיון עם יואב",
+    showTitle: "עושים טכנולוגיה",
+    enclosureUrl: "https://cdn.example.com/wrong.mp3",
+  };
+  /** Title varies, but every other signal corroborates. */
+  const richCorrect: EpisodeCandidate = {
+    id: "rich-correct",
+    title: "ריאיון עם יואב על שבבים",
+    showTitle: "עושים טכנולוגיה",
+    durationSeconds: 2335,
+    publishedAt: "Mon, 09 Jun 2025 06:00:00 +0300",
+    enclosureUrl: "https://cdn.example.com/correct.mp3",
+  };
+
+  it("never confidently selects the candidate that merely lacks evidence", () => {
+    const result = matchEpisode(query, [sparseWrong, richCorrect]);
+    if (result.status === "matched") {
+      expect(result.best.candidate.id).toBe("rich-correct");
+    } else {
+      expect(result.status).toBe("ambiguous");
+    }
+  });
+
+  it("scores missing evidence below corroborated evidence", () => {
+    const sparse = scoreCandidate(query, sparseWrong);
+    const rich = scoreCandidate(query, richCorrect);
+    expect(sparse.confidence).toBeLessThan(rich.confidence);
+  });
+
+  it("caps confidence at the candidate's evidence coverage", () => {
+    const sparse = scoreCandidate(query, sparseWrong);
+    expect(sparse.coverage).toBeLessThan(1);
+    expect(sparse.confidence).toBeLessThanOrEqual(sparse.coverage);
+  });
+
+  it("gives an absent signal zero credit rather than excluding it", () => {
+    const sparse = scoreCandidate(query, sparseWrong);
+    const duration = sparse.evidence.find((entry) => entry.signal === "duration");
+    expect(duration?.present).toBe(false);
+    expect(duration?.score).toBe(0);
+    expect(duration?.weight).toBeGreaterThan(0);
+  });
+
+  it("does not let dropping metadata raise a candidate's confidence", () => {
+    const withEverything = scoreCandidate(query, richCorrect);
+    const stripped = scoreCandidate(query, {
+      ...richCorrect,
+      durationSeconds: null,
+      publishedAt: null,
+    });
+    expect(stripped.confidence).toBeLessThanOrEqual(withEverything.confidence);
+  });
+
+  it("keeps weights normalized over the query's signals, not the candidate's", () => {
+    const sparse = scoreCandidate(query, sparseWrong);
+    const rich = scoreCandidate(query, richCorrect);
+    expect(sparse.evidence).toHaveLength(rich.evidence.length);
+    const sparseWeight = sparse.evidence.reduce((sum, entry) => sum + entry.weight, 0);
+    expect(sparseWeight).toBeCloseTo(1, 10);
   });
 });

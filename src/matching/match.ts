@@ -25,7 +25,17 @@ const SIGNAL_WEIGHTS = {
   publishedAt: 0.13,
 } as const;
 
-/** Score one candidate against the query, recording why. */
+/**
+ * Score one candidate against the query, recording why.
+ *
+ * The denominator is the weight of the signals the **query** carries, not the
+ * signals this candidate happens to have. Normalizing per candidate would let a
+ * sparse candidate concentrate all weight onto the fields it does have: an
+ * episode with a matching title and no duration or date would score 1.00 and
+ * beat a fully corroborated candidate whose title merely varies. Missing
+ * evidence therefore scores zero and lowers `coverage`; it never raises
+ * confidence.
+ */
 export function scoreCandidate(query: EpisodeQuery, candidate: EpisodeCandidate): ScoredCandidate {
   const raw: Array<Omit<SignalEvidence, "weight"> & { rawWeight: number }> = [];
 
@@ -33,33 +43,46 @@ export function scoreCandidate(query: EpisodeQuery, candidate: EpisodeCandidate)
     signal: "episodeTitle",
     score: titleSimilarity(query.episodeTitle, candidate.title),
     rawWeight: SIGNAL_WEIGHTS.episodeTitle,
+    present: true,
     detail: `"${query.episodeTitle}" vs "${candidate.title}"`,
   });
 
-  if (query.showTitle && candidate.showTitle) {
+  if (query.showTitle) {
+    const present = Boolean(candidate.showTitle);
     raw.push({
       signal: "showTitle",
-      score: titleSimilarity(query.showTitle, candidate.showTitle),
+      score: present ? titleSimilarity(query.showTitle, candidate.showTitle ?? "") : 0,
       rawWeight: SIGNAL_WEIGHTS.showTitle,
-      detail: `"${query.showTitle}" vs "${candidate.showTitle}"`,
+      present,
+      detail: present
+        ? `"${query.showTitle}" vs "${candidate.showTitle ?? ""}"`
+        : "candidate provides no show title",
     });
   }
 
-  if (typeof query.durationSeconds === "number" && typeof candidate.durationSeconds === "number") {
+  if (typeof query.durationSeconds === "number") {
+    const present = typeof candidate.durationSeconds === "number";
     raw.push({
       signal: "duration",
-      score: durationSimilarity(query.durationSeconds, candidate.durationSeconds),
+      score: present ? durationSimilarity(query.durationSeconds, candidate.durationSeconds ?? 0) : 0,
       rawWeight: SIGNAL_WEIGHTS.duration,
-      detail: `${Math.round(query.durationSeconds)}s vs ${Math.round(candidate.durationSeconds)}s`,
+      present,
+      detail: present
+        ? `${Math.round(query.durationSeconds)}s vs ${Math.round(candidate.durationSeconds ?? 0)}s`
+        : "candidate provides no duration",
     });
   }
 
-  if (query.publishedAt && candidate.publishedAt) {
+  if (query.publishedAt) {
+    const present = Boolean(candidate.publishedAt);
     raw.push({
       signal: "publishedAt",
-      score: dateSimilarity(query.publishedAt, candidate.publishedAt),
+      score: present ? dateSimilarity(query.publishedAt, candidate.publishedAt ?? "") : 0,
       rawWeight: SIGNAL_WEIGHTS.publishedAt,
-      detail: `${query.publishedAt} vs ${candidate.publishedAt}`,
+      present,
+      detail: present
+        ? `${query.publishedAt} vs ${candidate.publishedAt ?? ""}`
+        : "candidate provides no publication date",
     });
   }
 
@@ -69,8 +92,9 @@ export function scoreCandidate(query: EpisodeQuery, candidate: EpisodeCandidate)
     weight: rawWeight / totalWeight,
   }));
   const confidence = evidence.reduce((sum, entry) => sum + entry.score * entry.weight, 0);
+  const coverage = evidence.reduce((sum, entry) => sum + (entry.present ? entry.weight : 0), 0);
 
-  return { candidate, confidence, evidence };
+  return { candidate, confidence, coverage, evidence };
 }
 
 /**

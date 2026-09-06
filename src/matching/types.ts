@@ -26,18 +26,26 @@ export interface EpisodeQuery {
 /** Per-signal contribution to a candidate's score. */
 export interface SignalEvidence {
   signal: "episodeTitle" | "showTitle" | "duration" | "publishedAt" | "description";
-  /** 0..1 similarity for this signal. */
+  /** 0..1 similarity for this signal. Zero when the candidate does not supply it. */
   score: number;
-  /** Weight actually applied, after renormalizing over available signals. */
+  /** Weight applied, normalized over the signals the *query* carries. */
   weight: number;
-  /** Human-readable Hebrew-safe explanation of what was compared. */
+  /** False when the query offered this signal but the candidate has no value for it. */
+  present: boolean;
+  /** Human-readable explanation of what was compared. */
   detail: string;
 }
 
 export interface ScoredCandidate {
   candidate: EpisodeCandidate;
-  /** Weighted 0..1 confidence. */
+  /** Weighted 0..1 confidence, comparable across candidates of the same query. */
   confidence: number;
+  /**
+   * Fraction of the query's signal weight this candidate actually supplied.
+   * A candidate missing metadata has coverage below 1 and can never reach a
+   * confidence its evidence does not support.
+   */
+  coverage: number;
   evidence: SignalEvidence[];
 }
 
