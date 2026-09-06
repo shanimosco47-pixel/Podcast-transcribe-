@@ -15,9 +15,13 @@ export interface FixtureRoute {
  * A `fetch` backed by recorded responses. Any URL not in the map rejects, so a
  * test can never silently reach the network.
  */
+/** Fixture hosts do not exist, so DNS is stubbed to a public address. */
+export const publicResolveHost = (): Promise<string[]> => Promise.resolve(["93.184.216.34"]);
+
 export function fixtureFetch(routes: Record<string, FixtureRoute>): {
   fetch: typeof fetch;
   requested: string[];
+  resolveHost: typeof publicResolveHost;
 } {
   const requested: string[] = [];
 
@@ -35,5 +39,5 @@ export function fixtureFetch(routes: Record<string, FixtureRoute>): {
     );
   }) as typeof fetch;
 
-  return { fetch: impl, requested };
+  return { fetch: impl, requested, resolveHost: publicResolveHost };
 }

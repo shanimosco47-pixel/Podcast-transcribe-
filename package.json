@@ -10,7 +10,9 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:mobile": "vitest run tests/mobile.360.test.ts"
+    "test:mobile": "vitest run tests/mobile.360.test.ts",
+    "start": "node dist/server/main.js",
+    "build": "tsc -p tsconfig.build.json"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",

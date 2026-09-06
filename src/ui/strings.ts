@@ -33,6 +33,15 @@ export const HE = {
   ambiguousConfirm: "אישור הבחירה",
   errorTitle: "לא הצלחנו להמשיך",
   retry: "נסו קישור אחר",
+  working: "עובדים על זה",
+  workingBody: "התמלול יכול לקחת כמה דקות. הדף מתרענן לבד.",
+  phaseQueued: "ממתין בתור",
+  phaseResolving: "מזהים את הפרק",
+  phaseDownloading: "מורידים את האודיו",
+  phaseTranscribing: "מתמללים",
+  phaseSummarizing: "מסכמים",
+  queuePosition: "מקום בתור",
+  chunkProgress: "קטע",
 } as const;
 
 /** One Hebrew sentence per failure, plus what the person can do about it. */
@@ -65,7 +74,9 @@ export function failureMessage(reason: FailureReason): string {
     case "no_audio":
       return "לפרק הזה אין קובץ אודיו ציבורי ואין תמלול מוכן.";
     case "transcript_unavailable":
-      return "התמלול שפורסם בפיד אינו זמין כרגע.";
+      return "לא הצלחנו להשיג את התמלול של הפרק. נסו שוב מאוחר יותר.";
+    case "queue_full":
+      return "יש כרגע יותר מדי בקשות בתור. נסו שוב בעוד כמה דקות.";
     default:
       return "אירעה תקלה בלתי צפויה.";
   }

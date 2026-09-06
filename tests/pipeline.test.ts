@@ -3,11 +3,13 @@ import { describe, expect, it } from "vitest";
 import { runPipeline } from "../src/pipeline.js";
 import {
   ambiguousScenario,
+  CHUNK_COUNT,
   EP12_EPISODE_URL,
   feedTranscriptScenario,
   showMismatchScenario,
   HEBREW_TRANSCRIPT,
   transcriptionScenario,
+  YOAV_ENCLOSURE_URL,
   YOAV_EPISODE_URL,
 } from "./support/scenarios.js";
 
@@ -27,7 +29,7 @@ describe("runPipeline — end to end over recorded fixtures", () => {
     expect(outcome.evidence.publishedAt).toBeTruthy();
 
     expect(outcome.transcript.source).toBe("transcription");
-    expect(outcome.transcript.text).toBe(HEBREW_TRANSCRIPT);
+    expect(outcome.transcript.text).toContain(HEBREW_TRANSCRIPT);
     expect(outcome.summary.keyPoints.length).toBeGreaterThan(0);
   });
 
@@ -35,10 +37,30 @@ describe("runPipeline — end to end over recorded fixtures", () => {
     const scenario = transcriptionScenario();
     await runPipeline(YOAV_EPISODE_URL, scenario);
 
-    expect(scenario.transcription.calls).toHaveLength(1);
-    expect(scenario.transcription.calls[0]?.language).toBe("he");
-    expect(scenario.transcription.calls[0]?.audioUrl).toBe("https://cdn.example.com/audio/yoav.mp3");
-    expect(scenario.transcription.calls[0]?.durationSecondsHint).toBe(2335);
+    expect(scenario.transcription.calls).toHaveLength(CHUNK_COUNT);
+    expect(scenario.transcription.calls.every((call) => call.language === "he")).toBe(true);
+  });
+
+  it("transcribes chunks in playback order", async () => {
+    const scenario = transcriptionScenario();
+    await runPipeline(YOAV_EPISODE_URL, scenario);
+
+    const order = scenario.transcription.calls.map(
+      (call) => Number(call.audioUrl.match(/chunk-(\d+)/)?.[1] ?? -1),
+    );
+    expect(order).toEqual([...Array(CHUNK_COUNT).keys()]);
+  });
+
+  it("downloads the enclosure and hands the provider a local file, not the URL", async () => {
+    const scenario = transcriptionScenario();
+    await runPipeline(YOAV_EPISODE_URL, scenario);
+
+    // The audio is fetched from the public feed CDN...
+    expect(scenario.requested).toContain(YOAV_ENCLOSURE_URL);
+    // ...and the provider receives a local path, so no remote URL is forwarded.
+    const audioUrl = scenario.transcription.calls[0]?.audioUrl ?? "";
+    expect(audioUrl).not.toMatch(/^https?:/);
+    expect(audioUrl).toContain("chunk-");
   });
 
   it("prefers a transcript published in the feed over transcribing audio", async () => {

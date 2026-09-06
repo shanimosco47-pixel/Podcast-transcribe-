@@ -44,6 +44,13 @@ async function withPage<T>(
   }
 }
 
+/** Submitting is asynchronous now: the working page appears first. */
+async function submitAndWait(page: Page, url: string, settled: string): Promise<void> {
+  await page.fill("#url", url);
+  await page.click("button[type=submit]");
+  await page.waitForSelector(settled, { timeout: 30_000 });
+}
+
 /** Nothing may overflow the viewport horizontally on a 360 px phone. */
 async function assertNoHorizontalOverflow(page: Page): Promise<void> {
   const overflow = await page.evaluate(
@@ -70,9 +77,7 @@ describe("Hebrew RTL mobile UI at 360 px", () => {
   it("shows the identified episode, summary and transcript on one narrow screen", async () => {
     await withPage(transcriptionScenario(), async (page, base) => {
       await page.goto(base);
-      await page.fill("#url", YOAV_EPISODE_URL);
-      await page.click("button[type=submit]");
-      await page.waitForSelector("#transcript-text");
+      await submitAndWait(page, YOAV_EPISODE_URL, "#transcript-text");
 
       await expect(page.getByText("ריאיון עם יואב על שבבים")).toBeTruthy();
       expect(await page.textContent("#transcript-text")).toContain("שבבים");
@@ -89,9 +94,7 @@ describe("Hebrew RTL mobile UI at 360 px", () => {
   it("presents the ambiguity choice without preselecting a transcript", async () => {
     await withPage(ambiguousScenario(), async (page, base) => {
       await page.goto(base);
-      await page.fill("#url", YOAV_EPISODE_URL);
-      await page.click("button[type=submit]");
-      await page.waitForSelector("input[type=radio]");
+      await submitAndWait(page, YOAV_EPISODE_URL, "input[type=radio]");
 
       expect(await page.locator("input[type=radio]").count()).toBeGreaterThan(1);
       expect(await page.locator("#transcript-text").count()).toBe(0);
@@ -105,9 +108,7 @@ describe("Hebrew RTL mobile UI at 360 px", () => {
     await withPage(transcriptionScenario(), async (page, base) => {
       await page.goto(base);
       await page.evaluate(() => document.querySelector("form")?.setAttribute("novalidate", "true"));
-      await page.fill("#url", "https://example.com/not-spotify");
-      await page.click("button[type=submit]");
-      await page.waitForSelector(".notice.error");
+      await submitAndWait(page, "https://example.com/not-spotify", ".notice.error");
 
       expect(await page.textContent(".notice.error")).toContain("ספוטיפיי");
       // The technical reason stays behind a closed disclosure.
@@ -117,4 +118,41 @@ describe("Hebrew RTL mobile UI at 360 px", () => {
       await page.screenshot({ path: `${SHOTS}/360-error.png`, fullPage: true });
     });
   }, 60_000);
+});
+
+describe("progress state at 360 px", () => {
+  it("shows a Hebrew working page while the job runs, then the result", async () => {
+    // A job that stays running long enough for the working page to be captured.
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const scenario = transcriptionScenario();
+    const slow = {
+      ...scenario,
+      summarizer: {
+        name: "slow",
+        calls: [],
+        async summarize(request: { transcript: string; episodeTitle: string; language: string }) {
+          await held;
+          return scenario.summarizer.summarize(request);
+        },
+      },
+    };
+
+    await withPage(slow as unknown as Parameters<typeof createApp>[0]["deps"], async (page, base) => {
+      await page.goto(base);
+      await page.fill("#url", YOAV_EPISODE_URL);
+      await page.click("button[type=submit]");
+
+      await page.waitForSelector(".bar", { timeout: 15_000 });
+      expect(await page.textContent("body")).toContain("עובדים על זה");
+      await assertNoHorizontalOverflow(page);
+      await page.screenshot({ path: `${SHOTS}/360-progress.png`, fullPage: true });
+
+      release();
+      await page.waitForSelector("#transcript-text", { timeout: 30_000 });
+    });
+  }, 90_000);
 });

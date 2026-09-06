@@ -1,3 +1,4 @@
+import type { Job, JobPhase } from "../jobs/store.js";
 import type { PipelineOutcome } from "../pipeline.js";
 import type { ScoredCandidate } from "../matching/types.js";
 import type { ResolutionEvidence } from "../resolve/resolver.js";
@@ -122,18 +123,30 @@ li { margin-bottom: .4rem; }
 details { margin-top: 1rem; color: var(--muted); font-size: .9rem; }
 summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; }
 code { font-size: .85rem; }
+.bar {
+  block-size: 10px; border-radius: 999px; background: var(--line);
+  overflow: hidden; margin: .75rem 0;
+}
+.bar span { display: block; block-size: 100%; background: var(--accent); inline-size: 0; }
+.bar.indeterminate span { inline-size: 40%; animation: slide 1.2s ease-in-out infinite; }
+@keyframes slide { from { margin-inline-start: -40%; } to { margin-inline-start: 100%; } }
+@media (prefers-reduced-motion: reduce) {
+  .bar.indeterminate span { animation: none; inline-size: 100%; }
+}
+p.meta { color: var(--muted); font-size: .9rem; }
 .visually-hidden {
   position: absolute; width: 1px; height: 1px; overflow: hidden;
   clip-path: inset(50%); white-space: nowrap;
 }
 `;
 
-function layout(bodyHtml: string): string {
+function layout(bodyHtml: string, extraHead = ""): string {
   return `<!DOCTYPE html>
 <html lang="he" dir="rtl">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+${extraHead}
 <title>${escapeHtml(HE.appTitle)}</title>
 <style>${STYLE}</style>
 </head>
@@ -281,4 +294,50 @@ export function renderError(
 </details>
 </section>
 ${form()}`);
+}
+
+const PHASE_LABEL: Record<JobPhase, string> = {
+  queued: HE.phaseQueued,
+  resolving: HE.phaseResolving,
+  downloading: HE.phaseDownloading,
+  transcribing: HE.phaseTranscribing,
+  summarizing: HE.phaseSummarizing,
+  awaiting_choice: HE.ambiguousTitle,
+  done: HE.identified,
+  failed: HE.errorTitle,
+};
+
+/**
+ * Status page for a job still running.
+ *
+ * Refreshes itself with a meta refresh rather than JavaScript, so progress is
+ * visible even if a script fails to run, and re-renders as the result page the
+ * moment the job finishes.
+ */
+export function renderProgress(job: Job): string {
+  const { phase, done, total } = job.progress;
+  const label = PHASE_LABEL[phase] ?? HE.working;
+
+  const detail =
+    phase === "queued" && job.queuePosition !== null
+      ? `${escapeHtml(HE.queuePosition)}: ${job.queuePosition}`
+      : total > 1
+        ? `${escapeHtml(HE.chunkProgress)} ${done + 1} / ${total}`
+        : "";
+
+  const percent = total > 0 ? Math.round((done / total) * 100) : null;
+
+  return layout(`
+<section class="card" aria-labelledby="working" aria-live="polite">
+<h2 id="working">${escapeHtml(HE.working)}</h2>
+<p>${escapeHtml(label)}${detail ? ` — ${detail}` : ""}</p>
+${
+  percent === null
+    ? '<div class="bar indeterminate"><span></span></div>'
+    : `<div class="bar"><span style="inline-size:${percent}%"></span></div>`
+}
+<p class="meta">${escapeHtml(HE.workingBody)}</p>
+</section>
+<noscript><p class="meta">${escapeHtml(HE.workingBody)}</p></noscript>`,
+    '<meta http-equiv="refresh" content="2">');
 }

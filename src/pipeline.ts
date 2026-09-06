@@ -1,4 +1,8 @@
-import { checkOutboundUrl } from "./http/url-guard.js";
+import { SafeFetchError, safeFetchText } from "./http/safe-fetch.js";
+import { downloadAudio } from "./media/download.js";
+import { FfmpegAudioTool, type AudioTool } from "./media/ffmpeg.js";
+import { transcribeAudioFile } from "./media/transcribe-audio.js";
+import { withWorkspace } from "./media/workspace.js";
 import type { ScoredCandidate } from "./matching/types.js";
 import { resolveEpisode, type ResolutionEvidence, type ResolutionFailure, type ResolverDeps } from "./resolve/resolver.js";
 import type { FeedEpisode } from "./matching/feed.js";
@@ -8,7 +12,13 @@ import { TRANSCRIPTION_LANGUAGE, type TranscriptionAdapter } from "./transcripti
 export interface PipelineDeps extends ResolverDeps {
   transcription: TranscriptionAdapter;
   summarizer: SummarizerAdapter;
+  /** Injectable so tests run without a binary; defaults to the real ffmpeg. */
+  audioTool?: AudioTool;
+  /** Phase callback for the job queue. No-op when running synchronously. */
+  onPhase?: (phase: "downloading" | "transcribing" | "summarizing", done?: number, total?: number) => void;
 }
+
+const TRANSCRIPT_LIMITS = { maxBytes: 8 * 1024 * 1024, timeoutMs: 60_000 } as const;
 
 export interface TranscriptOutcome {
   text: string;
@@ -25,7 +35,7 @@ export type PipelineOutcome =
       summary: SummaryResult;
     }
   | { status: "ambiguous"; reason: string; feedUrl: string; candidates: ScoredCandidate[] }
-  | { status: "failed"; reason: ResolutionFailure | "no_audio" | "transcript_unavailable"; detail: string };
+  | { status: "failed"; reason: ResolutionFailure | "no_audio" | "transcript_unavailable" | "queue_full"; detail: string };
 
 /**
  * Spotify URL to Hebrew transcript and summary.
@@ -43,6 +53,7 @@ export async function runPipeline(input: string, deps: PipelineDeps): Promise<Pi
   const transcript = await obtainTranscript(evidence, episode.transcript?.url ?? null, deps);
   if ("failure" in transcript) return transcript.failure;
 
+  deps.onPhase?.("summarizing");
   const summary = await deps.summarizer.summarize({
     transcript: transcript.text,
     episodeTitle: evidence.episodeTitle,
@@ -58,21 +69,12 @@ async function obtainTranscript(
   deps: PipelineDeps,
 ): Promise<TranscriptOutcome | { failure: Extract<PipelineOutcome, { status: "failed" }> }> {
   if (transcriptUrl) {
-    const guard = checkOutboundUrl(transcriptUrl);
-    if (!guard.ok) {
-      return { failure: { status: "failed", reason: "blocked_url", detail: guard.reason } };
+    try {
+      const response = await safeFetchText(transcriptUrl, TRANSCRIPT_LIMITS, deps);
+      return { text: response.text, source: "feed_transcript", provider: "rss" };
+    } catch (error) {
+      return { failure: transcriptFailure(error) };
     }
-    const response = await deps.fetch(guard.url.toString(), { redirect: "follow" });
-    if (!response.ok) {
-      return {
-        failure: {
-          status: "failed",
-          reason: "transcript_unavailable",
-          detail: `Feed transcript responded ${response.status}`,
-        },
-      };
-    }
-    return { text: await response.text(), source: "feed_transcript", provider: "rss" };
   }
 
   if (!evidence.enclosureUrl) {
@@ -85,17 +87,45 @@ async function obtainTranscript(
     };
   }
 
-  const guard = checkOutboundUrl(evidence.enclosureUrl);
-  if (!guard.ok) {
-    return { failure: { status: "failed", reason: "blocked_url", detail: guard.reason } };
-  }
+  // The workspace owns the downloaded file and every chunk, and is removed on
+  // both paths out of this block.
+  try {
+    const enclosureUrl = evidence.enclosureUrl;
+    const result = await withWorkspace(async (workspace) => {
+      deps.onPhase?.("downloading");
+      const audio = await downloadAudio(enclosureUrl, workspace, deps);
 
-  const result = await deps.transcription.transcribe({
-    audioUrl: guard.url.toString(),
-    language: TRANSCRIPTION_LANGUAGE,
-    durationSecondsHint: evidence.durationSeconds,
-  });
-  return { text: result.text, source: "transcription", provider: result.provider };
+      deps.onPhase?.("transcribing");
+      const tool = deps.audioTool ?? new FfmpegAudioTool();
+      return transcribeAudioFile(audio.path, workspace, tool, deps.transcription, {
+        durationSeconds: evidence.durationSeconds,
+        onProgress: (done, total) => deps.onPhase?.("transcribing", done, total),
+      });
+    });
+    return { text: result.text, source: "transcription", provider: result.provider };
+  } catch (error) {
+    return { failure: transcriptFailure(error) };
+  }
+}
+
+function transcriptFailure(error: unknown): Extract<PipelineOutcome, { status: "failed" }> {
+  if (error instanceof SafeFetchError) {
+    const blocked =
+      error.reason === "blocked_host" ||
+      error.reason === "bad_scheme" ||
+      error.reason === "credentials_in_url" ||
+      error.reason === "resolves_to_blocked_address";
+    return {
+      status: "failed",
+      reason: blocked ? "blocked_url" : "transcript_unavailable",
+      detail: error.message,
+    };
+  }
+  return {
+    status: "failed",
+    reason: "transcript_unavailable",
+    detail: error instanceof Error ? error.message : String(error),
+  };
 }
 
 /**

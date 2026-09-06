@@ -1,4 +1,4 @@
-import { checkOutboundUrl } from "../http/url-guard.js";
+import { SafeFetchError, safeFetchText, type SafeFetchDeps } from "../http/safe-fetch.js";
 import { feedEpisodes, type FeedEpisode } from "../matching/feed.js";
 import { matchEpisode } from "../matching/match.js";
 import { titleSimilarity } from "../matching/similarity.js";
@@ -40,10 +40,11 @@ export type ResolutionFailure =
   | "blocked_url"
   | "no_match";
 
-export interface ResolverDeps {
-  /** Injected so tests drive recorded fixtures and production drives the network. */
-  fetch: typeof fetch;
-}
+export type ResolverDeps = SafeFetchDeps;
+
+/** Metadata and feed documents are text; these caps are generous but finite. */
+const METADATA_LIMITS = { maxBytes: 2 * 1024 * 1024, timeoutMs: 30_000 } as const;
+const FEED_LIMITS = { maxBytes: 16 * 1024 * 1024, timeoutMs: 60_000 } as const;
 
 /**
  * Spotify episode URL to a specific RSS episode.
@@ -119,27 +120,19 @@ type EmbedStep =
   | { status: "error"; outcome: ResolutionOutcome };
 
 async function fetchEmbed(embedUrl: string, deps: ResolverDeps): Promise<EmbedStep> {
-  const guard = checkOutboundUrl(embedUrl, ALLOWED_METADATA_HOSTS);
-  if (!guard.ok) {
-    return {
-      status: "error",
-      outcome: { status: "failed", reason: "blocked_url", detail: guard.reason },
-    };
+  let html: string;
+  try {
+    const response = await safeFetchText(
+      embedUrl,
+      { ...METADATA_LIMITS, allowedHosts: ALLOWED_METADATA_HOSTS, accept: "text/html" },
+      deps,
+    );
+    html = response.text;
+  } catch (error) {
+    return { status: "error", outcome: fetchFailure(error, "embed_unavailable") };
   }
 
-  const response = await deps.fetch(embedUrl, { redirect: "follow" });
-  if (!response.ok) {
-    return {
-      status: "error",
-      outcome: {
-        status: "failed",
-        reason: "embed_unavailable",
-        detail: `Spotify embed responded ${response.status}`,
-      },
-    };
-  }
-
-  const data = extractSpotifyEmbedData(await response.text());
+  const data = extractSpotifyEmbedData(html);
   if (!data) {
     return {
       status: "error",
@@ -151,6 +144,29 @@ async function fetchEmbed(embedUrl: string, deps: ResolverDeps): Promise<EmbedSt
     };
   }
   return { status: "ok", data };
+}
+
+/** Map a safe-fetch rejection onto the resolution failure the UI explains. */
+function fetchFailure(error: unknown, fallback: ResolutionFailure): ResolutionOutcome {
+  if (error instanceof SafeFetchError) {
+    const blocked =
+      error.reason === "blocked_host" ||
+      error.reason === "bad_scheme" ||
+      error.reason === "host_not_allowed" ||
+      error.reason === "credentials_in_url" ||
+      error.reason === "resolves_to_blocked_address" ||
+      error.reason === "too_many_redirects";
+    return {
+      status: "failed",
+      reason: blocked ? "blocked_url" : fallback,
+      detail: error.message,
+    };
+  }
+  return {
+    status: "failed",
+    reason: fallback,
+    detail: error instanceof Error ? error.message : String(error),
+  };
 }
 
 type FeedStep =
@@ -171,37 +187,30 @@ async function resolveFeed(showTitle: string, deps: ResolverDeps): Promise<FeedS
     entity: "podcast",
     limit: "10",
   });
-  const searchUrl = `https://itunes.apple.com/search?${query.toString()}`;
-  const guard = checkOutboundUrl(searchUrl, ALLOWED_METADATA_HOSTS);
-  if (!guard.ok) {
-    return {
-      status: "error",
-      outcome: { status: "failed", reason: "blocked_url", detail: guard.reason },
-    };
+
+  let payload: { results?: unknown };
+  try {
+    const response = await safeFetchText(
+      `https://itunes.apple.com/search?${query.toString()}`,
+      { ...METADATA_LIMITS, allowedHosts: ALLOWED_METADATA_HOSTS, accept: "application/json" },
+      deps,
+    );
+    payload = JSON.parse(response.text) as { results?: unknown };
+  } catch (error) {
+    return { status: "error", outcome: fetchFailure(error, "feed_not_found") };
   }
 
-  const response = await deps.fetch(searchUrl, { redirect: "follow" });
-  if (!response.ok) {
-    return {
-      status: "error",
-      outcome: {
-        status: "failed",
-        reason: "feed_not_found",
-        detail: `Podcast directory responded ${response.status}`,
-      },
-    };
-  }
-
-  const payload = (await response.json()) as { results?: unknown };
   const results = Array.isArray(payload.results) ? payload.results : [];
-
   const ranked = results
     .filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null)
-    .map((entry) => ({
-      feedUrl: typeof entry.feedUrl === "string" ? entry.feedUrl : null,
-      name: typeof entry.collectionName === "string" ? entry.collectionName : "",
-      score: titleSimilarity(showTitle, typeof entry.collectionName === "string" ? entry.collectionName : ""),
-    }))
+    .map((entry) => {
+      const name = typeof entry.collectionName === "string" ? entry.collectionName : "";
+      return {
+        feedUrl: typeof entry.feedUrl === "string" ? entry.feedUrl : null,
+        name,
+        score: titleSimilarity(showTitle, name),
+      };
+    })
     .filter((entry) => entry.feedUrl !== null)
     .sort((a, b) => b.score - a.score);
 
@@ -227,24 +236,12 @@ async function resolveFeed(showTitle: string, deps: ResolverDeps): Promise<FeedS
     };
   }
 
-  const feedGuard = checkOutboundUrl(best.feedUrl ?? "");
-  if (!feedGuard.ok) {
-    return {
-      status: "error",
-      outcome: { status: "failed", reason: "blocked_url", detail: feedGuard.reason },
-    };
+  try {
+    // The feed URL comes from a third-party directory, so it gets the full guard
+    // with no host allowlist: any public host is legitimate, private ones are not.
+    const feed = await safeFetchText(best.feedUrl ?? "", { ...FEED_LIMITS, accept: "application/rss+xml, application/xml, text/xml" }, deps);
+    return { status: "ok", url: feed.url, xml: feed.text };
+  } catch (error) {
+    return { status: "error", outcome: fetchFailure(error, "feed_unavailable") };
   }
-
-  const feedResponse = await deps.fetch(feedGuard.url.toString(), { redirect: "follow" });
-  if (!feedResponse.ok) {
-    return {
-      status: "error",
-      outcome: {
-        status: "failed",
-        reason: "feed_unavailable",
-        detail: `Feed responded ${feedResponse.status}`,
-      },
-    };
-  }
-  return { status: "ok", url: feedGuard.url.toString(), xml: await feedResponse.text() };
 }

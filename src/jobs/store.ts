@@ -1,11 +1,32 @@
 import type { FeedEpisode } from "../matching/feed.js";
 import type { PipelineOutcome } from "../pipeline.js";
 
+export type JobPhase =
+  | "queued"
+  | "resolving"
+  | "downloading"
+  | "transcribing"
+  | "summarizing"
+  | "awaiting_choice"
+  | "done"
+  | "failed";
+
+export interface JobProgress {
+  phase: JobPhase;
+  /** Completed units of the current phase, and how many there are. */
+  done: number;
+  total: number;
+}
+
 export interface Job {
   id: string;
-  outcome: PipelineOutcome;
+  progress: JobProgress;
+  /** Present once the run finishes, either way. */
+  outcome: PipelineOutcome | null;
   /** Candidates kept only while a job waits for the user to disambiguate. */
   pending: { feedUrl: string; episodes: FeedEpisode[] } | null;
+  /** Position in the queue while waiting, otherwise null. */
+  queuePosition: number | null;
 }
 
 /**
@@ -16,9 +37,9 @@ export interface Job {
  * disk, which keeps the default of not storing transcripts permanently.
  */
 export interface JobStore {
-  create(job: Omit<Job, "id">): Job;
+  create(): Job;
   get(id: string): Job | undefined;
-  replace(id: string, job: Omit<Job, "id">): Job | undefined;
+  update(id: string, patch: Partial<Omit<Job, "id">>): Job | undefined;
 }
 
 export class InMemoryJobStore implements JobStore {
@@ -26,19 +47,26 @@ export class InMemoryJobStore implements JobStore {
 
   constructor(private readonly makeId: () => string = () => crypto.randomUUID()) {}
 
-  create(job: Omit<Job, "id">): Job {
-    const created: Job = { ...job, id: this.makeId() };
-    this.jobs.set(created.id, created);
-    return created;
+  create(): Job {
+    const job: Job = {
+      id: this.makeId(),
+      progress: { phase: "queued", done: 0, total: 0 },
+      outcome: null,
+      pending: null,
+      queuePosition: null,
+    };
+    this.jobs.set(job.id, job);
+    return job;
   }
 
   get(id: string): Job | undefined {
     return this.jobs.get(id);
   }
 
-  replace(id: string, job: Omit<Job, "id">): Job | undefined {
-    if (!this.jobs.has(id)) return undefined;
-    const updated: Job = { ...job, id };
+  update(id: string, patch: Partial<Omit<Job, "id">>): Job | undefined {
+    const existing = this.jobs.get(id);
+    if (!existing) return undefined;
+    const updated: Job = { ...existing, ...patch };
     this.jobs.set(id, updated);
     return updated;
   }

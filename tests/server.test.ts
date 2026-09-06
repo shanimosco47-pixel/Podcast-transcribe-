@@ -3,6 +3,8 @@ import type { Server } from "node:http";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { JobQueue, QueueFullError } from "../src/jobs/queue.js";
+import { InMemoryJobStore } from "../src/jobs/store.js";
 import { createApp } from "../src/server/app.js";
 import { ambiguousScenario, transcriptionScenario, YOAV_EPISODE_URL } from "./support/scenarios.js";
 
@@ -21,6 +23,12 @@ afterEach(async () => {
   server = null;
 });
 
+/**
+ * Submit, then poll the job page until it leaves the progress state.
+ *
+ * Submitting no longer blocks on the run, so the immediate response is the
+ * "working" page; the result appears on a later poll.
+ */
 async function submit(base: string, url: string): Promise<{ finalUrl: string; html: string }> {
   const response = await fetch(`${base}/transcribe`, {
     method: "POST",
@@ -28,7 +36,17 @@ async function submit(base: string, url: string): Promise<{ finalUrl: string; ht
     body: new URLSearchParams({ url }).toString(),
     redirect: "follow",
   });
-  return { finalUrl: response.url, html: await response.text() };
+  return waitForJob(response.url);
+}
+
+async function waitForJob(jobUrl: string): Promise<{ finalUrl: string; html: string }> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const page = await fetch(jobUrl);
+    const html = await page.text();
+    if (!html.includes("עובדים על זה")) return { finalUrl: jobUrl, html };
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Job at ${jobUrl} never finished`);
 }
 
 describe("server", () => {
@@ -97,7 +115,7 @@ describe("server", () => {
       body: new URLSearchParams({ episodeId: value }).toString(),
       redirect: "follow",
     });
-    const confirmedHtml = await confirmed.text();
+    const { html: confirmedHtml } = await waitForJob(confirmed.url);
     expect(confirmedHtml).toContain("התמלול המלא");
   });
 
@@ -105,5 +123,80 @@ describe("server", () => {
     const base = await start(transcriptionScenario());
     const response = await fetch(base);
     expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+});
+
+describe("asynchronous job handling", () => {
+  it("returns a progress page immediately instead of blocking on the run", async () => {
+    const base = await start(transcriptionScenario());
+    const response = await fetch(`${base}/transcribe`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ url: YOAV_EPISODE_URL }).toString(),
+      redirect: "follow",
+    });
+
+    const html = await response.text();
+    // The very first render is the working page, not a finished transcript.
+    expect(html).toContain("עובדים על זה");
+    expect(html).toContain('http-equiv="refresh"');
+
+    await waitForJob(response.url);
+  });
+
+  it("runs one job at a time for a single user", async () => {
+    const queue = new JobQueue(new InMemoryJobStore(), { concurrency: 1 });
+    let peak = 0;
+    let active = 0;
+
+    const work = async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      active -= 1;
+      return { status: "failed", reason: "no_match", detail: "test" } as const;
+    };
+
+    for (let i = 0; i < 5; i += 1) queue.submit(work);
+    await queue.drain();
+
+    expect(peak).toBe(1);
+  });
+
+  it("refuses new work once the queue is full rather than growing without limit", async () => {
+    const queue = new JobQueue(new InMemoryJobStore(), { concurrency: 1, maxQueued: 2 });
+    const blocked = () =>
+      new Promise<never>(() => {
+        /* never resolves: holds the queue */
+      });
+
+    // One starts running, two wait. maxQueued bounds the waiting list only.
+    queue.submit(blocked);
+    queue.submit(blocked);
+    queue.submit(blocked);
+    expect(queue.runningCount).toBe(1);
+    expect(queue.queuedCount).toBe(2);
+
+    expect(() => queue.submit(blocked)).toThrow(QueueFullError);
+  });
+
+  it("reports a full queue in Hebrew rather than failing silently", async () => {
+    const queue = new JobQueue(new InMemoryJobStore(), { concurrency: 1, maxQueued: 1 });
+    queue.submit(() => new Promise<never>(() => {}));
+    queue.submit(() => new Promise<never>(() => {}));
+
+    const app = createApp({ deps: transcriptionScenario(), queue });
+    server = app;
+    await new Promise<void>((resolve) => app.listen(0, "127.0.0.1", resolve));
+    const { port } = app.address() as AddressInfo;
+
+    const response = await fetch(`http://127.0.0.1:${port}/transcribe`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ url: YOAV_EPISODE_URL }).toString(),
+    });
+
+    expect(response.status).toBe(503);
+    expect(await response.text()).toContain("יותר מדי בקשות");
   });
 });

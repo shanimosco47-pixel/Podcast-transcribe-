@@ -6,9 +6,8 @@
  * credentials in the URL, and hosts that resolve to private or reserved
  * address space by literal.
  *
- * Literal-address blocking does not stop a hostname that resolves to a private
- * address; that requires resolving before connect, which belongs with the real
- * fetch implementation in a later gate. Recorded here rather than implied.
+ * This checks the URL itself. Hostnames that resolve to private addresses are
+ * caught by `safeFetch`, which resolves every hop before connecting.
  */
 
 export type UrlRejection =
@@ -48,7 +47,14 @@ function isBlockedIpv4(host: string): boolean {
   );
 }
 
-function isBlockedHostname(hostname: string): boolean {
+/**
+ * True for loopback, private, link-local, CGNAT, documentation, benchmark and
+ * multicast addresses, and for names that always mean "this machine".
+ *
+ * Exported so `safeFetch` can apply the identical rule to resolved addresses;
+ * a second implementation would drift from this one.
+ */
+export function isBlockedAddress(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
   if (host === "::1" || host === "::") return true;
@@ -74,7 +80,7 @@ export function checkOutboundUrl(raw: string, allowedHosts?: readonly string[]):
     return { ok: false, reason: "bad_scheme" };
   }
   if (url.username || url.password) return { ok: false, reason: "credentials_in_url" };
-  if (isBlockedHostname(url.hostname)) return { ok: false, reason: "blocked_host" };
+  if (isBlockedAddress(url.hostname)) return { ok: false, reason: "blocked_host" };
 
   if (allowedHosts) {
     const host = url.hostname.toLowerCase();

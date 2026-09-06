@@ -1,20 +1,26 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
-import { InMemoryJobStore, type JobStore } from "../jobs/store.js";
-import type { FeedEpisode } from "../matching/feed.js";
+import { JobQueue, QueueFullError } from "../jobs/queue.js";
+import type { Job } from "../jobs/store.js";
 import { completeChosenEpisode, runPipeline, type PipelineDeps } from "../pipeline.js";
-import { renderAmbiguous, renderError, renderHome, renderResult } from "../ui/render.js";
+import {
+  renderAmbiguous,
+  renderError,
+  renderHome,
+  renderProgress,
+  renderResult,
+} from "../ui/render.js";
 
 export interface AppOptions {
   deps: PipelineDeps;
-  store?: JobStore;
+  queue?: JobQueue;
 }
 
 const MAX_BODY_BYTES = 8 * 1024;
 
-export function createApp({ deps, store = new InMemoryJobStore() }: AppOptions): Server {
+export function createApp({ deps, queue = new JobQueue() }: AppOptions): Server {
   return createServer((req, res) => {
-    handle(req, res, deps, store).catch(() => {
+    handle(req, res, deps, queue).catch(() => {
       send(res, 500, renderError({ status: "failed", reason: "no_match", detail: "internal" }));
     });
   });
@@ -24,33 +30,47 @@ async function handle(
   req: IncomingMessage,
   res: ServerResponse,
   deps: PipelineDeps,
-  store: JobStore,
+  queue: JobQueue,
 ): Promise<void> {
-  const url = new URL(req.url ?? "/", "http://localhost");
-  const path = url.pathname;
+  const path = new URL(req.url ?? "/", "http://localhost").pathname;
 
   if (req.method === "GET" && path === "/") return send(res, 200, renderHome());
 
   if (req.method === "POST" && path === "/transcribe") {
     const form = await readForm(req);
-    const outcome = await runPipeline(form.get("url") ?? "", deps);
-    const job = store.create({ outcome, pending: pendingFrom(outcome) });
-    return redirect(res, `/jobs/${encodeURIComponent(job.id)}`);
+    const input = form.get("url") ?? "";
+    try {
+      // Returns as soon as the job is queued: the request never waits for a
+      // download and transcription that can take minutes.
+      const job = queue.submit((report) =>
+        runPipeline(input, {
+          ...deps,
+          onPhase: (phase, done, total) => report.set(phase, done, total),
+        }),
+      );
+      return redirect(res, `/jobs/${encodeURIComponent(job.id)}`);
+    } catch (error) {
+      if (error instanceof QueueFullError) {
+        return send(res, 503, renderError({ status: "failed", reason: "queue_full", detail: error.message }));
+      }
+      throw error;
+    }
   }
 
   const jobMatch = path.match(/^\/jobs\/([^/]+)(\/confirm|\/transcript\.txt)?$/);
   if (jobMatch) {
-    const job = store.get(decodeURIComponent(jobMatch[1] ?? ""));
+    const job = queue.store.get(decodeURIComponent(jobMatch[1] ?? ""));
     if (!job) return send(res, 404, renderHome());
     const suffix = jobMatch[2];
 
-    if (req.method === "GET" && !suffix) return renderJob(res, job.id, job.outcome);
+    if (req.method === "GET" && !suffix) return renderJob(res, job);
 
     if (req.method === "GET" && suffix === "/transcript.txt") {
-      if (job.outcome.status !== "done") return redirect(res, `/jobs/${job.id}`);
+      if (job.outcome?.status !== "done") return redirect(res, `/jobs/${job.id}`);
       res.writeHead(200, {
         "content-type": "text/plain; charset=utf-8",
         "content-disposition": 'attachment; filename="transcript.txt"',
+        "cache-control": "no-store",
       });
       res.end(job.outcome.transcript.text);
       return;
@@ -59,32 +79,30 @@ async function handle(
     if (req.method === "POST" && suffix === "/confirm") {
       const form = await readForm(req);
       const chosenId = form.get("episodeId");
-      const episode = job.pending?.episodes.find((entry) => entry.id === chosenId);
-      if (!episode || !job.pending) return redirect(res, `/jobs/${job.id}`);
+      const pending = job.pending;
+      const episode = pending?.episodes.find((entry) => entry.id === chosenId);
+      if (!episode || !pending) return redirect(res, `/jobs/${job.id}`);
 
-      const outcome = await completeChosenEpisode(episode, job.pending.feedUrl, deps);
-      store.replace(job.id, { outcome, pending: null });
-      return redirect(res, `/jobs/${job.id}`);
+      // The confirmed run goes through the queue too, so a long transcription
+      // after a user choice does not block the request either.
+      const resumed = queue.submit((report) =>
+        completeChosenEpisode(episode, pending.feedUrl, {
+          ...deps,
+          onPhase: (phase, done, total) => report.set(phase, done, total),
+        }),
+      );
+      return redirect(res, `/jobs/${encodeURIComponent(resumed.id)}`);
     }
   }
 
   send(res, 404, renderHome());
 }
 
-function renderJob(res: ServerResponse, jobId: string, outcome: PipelineOutcomeLike): void {
-  if (outcome.status === "done") return send(res, 200, renderResult(outcome, jobId));
-  if (outcome.status === "ambiguous") return send(res, 200, renderAmbiguous(outcome, jobId));
-  send(res, 200, renderError(outcome));
-}
-
-type PipelineOutcomeLike = Awaited<ReturnType<typeof runPipeline>>;
-
-function pendingFrom(outcome: PipelineOutcomeLike): { feedUrl: string; episodes: FeedEpisode[] } | null {
-  if (outcome.status !== "ambiguous") return null;
-  return {
-    feedUrl: outcome.feedUrl,
-    episodes: outcome.candidates.map((entry) => entry.candidate as FeedEpisode),
-  };
+function renderJob(res: ServerResponse, job: Job): void {
+  if (!job.outcome) return send(res, 200, renderProgress(job));
+  if (job.outcome.status === "done") return send(res, 200, renderResult(job.outcome, job.id));
+  if (job.outcome.status === "ambiguous") return send(res, 200, renderAmbiguous(job.outcome, job.id));
+  send(res, 200, renderError(job.outcome));
 }
 
 function send(res: ServerResponse, status: number, html: string): void {
