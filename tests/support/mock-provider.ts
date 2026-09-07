@@ -26,9 +26,16 @@ export interface MockProviderOptions {
   /** Text returned per call, in call order. Falls back to a generic line. */
   transcriptFor?: (call: number) => string;
   summary?: { summary: string; keyPoints: string[] };
+  /** Build a summary from what the model was actually sent, for flow tests. */
+  summaryFor?: (userContent: string, call: number) => { summary: string; keyPoints: string[] };
   /** Force a failure status on one endpoint. */
   failTranscription?: number;
   failSummary?: number;
+  /**
+   * Body returned with a forced failure. Used to prove a hostile provider
+   * cannot push its content into anything the user or a log sees.
+   */
+  errorBody?: string;
 }
 
 /** Pull a multipart field value out of a raw body without a parser dependency. */
@@ -73,7 +80,7 @@ export async function startMockProvider(options: MockProviderOptions = {}): Prom
 
         if (options.failTranscription) {
           res.writeHead(options.failTranscription, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: { message: "provider is unhappy" } }));
+          res.end(options.errorBody ?? JSON.stringify({ error: { message: "provider is unhappy" } }));
           return;
         }
 
@@ -97,14 +104,17 @@ export async function startMockProvider(options: MockProviderOptions = {}): Prom
 
         if (options.failSummary) {
           res.writeHead(options.failSummary, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: { message: "summary provider is unhappy" } }));
+          res.end(options.errorBody ?? JSON.stringify({ error: { message: "summary provider is unhappy" } }));
           return;
         }
 
-        const summary = options.summary ?? {
-          summary: "סיכום קצר בעברית.",
-          keyPoints: ["נקודה ראשונה", "נקודה שנייה"],
-        };
+        const userContent = summaries[summaries.length - 1]?.transcript ?? "";
+        const summary =
+          options.summaryFor?.(userContent, summaries.length - 1) ??
+          options.summary ?? {
+            summary: "סיכום קצר בעברית.",
+            keyPoints: ["נקודה ראשונה", "נקודה שנייה"],
+          };
         res.writeHead(200, { "content-type": "application/json" });
         res.end(
           JSON.stringify({ choices: [{ message: { content: JSON.stringify(summary) } }] }),

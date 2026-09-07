@@ -14,16 +14,37 @@ import {
 export class TranscriptionProviderError extends Error {
   constructor(
     readonly status: number,
-    detail: string,
+    readonly category: ProviderErrorCategory,
   ) {
-    super(`Transcription provider responded ${status}: ${detail}`);
+    super(`Transcription provider responded ${status} (${category})`);
     this.name = "TranscriptionProviderError";
   }
 }
 
+export type ProviderErrorCategory =
+  | "authentication"
+  | "rate_limited"
+  | "bad_request"
+  | "server_error"
+  | "malformed_response";
+
+/**
+ * Classify a provider failure from its status alone.
+ *
+ * The response *body* is never carried anywhere a user or a log can see it: a
+ * provider or a proxy in front of it can echo back the Authorization header,
+ * the request URL, or the transcript we just sent. A status code is a small
+ * fixed set and is safe to surface, so diagnosis keeps the status and loses
+ * only prose we could not vouch for.
+ */
+export function categorize(status: number): ProviderErrorCategory {
+  if (status === 401 || status === 403) return "authentication";
+  if (status === 429) return "rate_limited";
+  if (status >= 500) return "server_error";
+  return "bad_request";
+}
+
 const REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
-/** Provider error bodies are quoted back for diagnosis; cap them so nothing large leaks into logs. */
-const MAX_ERROR_DETAIL = 300;
 
 /**
  * OpenAI-compatible speech-to-text client.
@@ -61,23 +82,16 @@ export class OpenAiTranscriptionAdapter implements TranscriptionAdapter {
     });
 
     if (!response.ok) {
-      throw new TranscriptionProviderError(response.status, await errorDetail(response));
+      // The body is deliberately not read: nothing provider-controlled is
+      // allowed into an error that reaches the UI or a log.
+      await response.body?.cancel().catch(() => undefined);
+      throw new TranscriptionProviderError(response.status, categorize(response.status));
     }
 
     const payload = (await response.json()) as { text?: unknown };
     if (typeof payload.text !== "string") {
-      throw new TranscriptionProviderError(response.status, "response contained no text field");
+      throw new TranscriptionProviderError(response.status, "malformed_response");
     }
     return { text: payload.text, provider: this.name };
-  }
-}
-
-/** Read a bounded, non-sensitive slice of an error body. Never includes request headers. */
-export async function errorDetail(response: Response): Promise<string> {
-  try {
-    const text = await response.text();
-    return text.slice(0, MAX_ERROR_DETAIL).replace(/\s+/g, " ").trim() || "(empty body)";
-  } catch {
-    return "(unreadable body)";
   }
 }
