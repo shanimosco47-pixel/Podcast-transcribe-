@@ -4,6 +4,7 @@ import { chromium, type Browser, type Page } from "playwright";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createApp } from "../src/server/app.js";
+import { OwnerAuth } from "../src/server/auth.js";
 import { ambiguousScenario, transcriptionScenario, YOAV_EPISODE_URL } from "./support/scenarios.js";
 
 /** The narrow Android viewport the product targets. */
@@ -155,4 +156,106 @@ describe("progress state at 360 px", () => {
       await page.waitForSelector("#transcript-text", { timeout: 30_000 });
     });
   }, 90_000);
+});
+
+describe("result actions at 360 px", () => {
+  it("copies the transcript to the clipboard when the button is tapped", async () => {
+    const app = createApp({ deps: transcriptionScenario() });
+    await new Promise<void>((resolve) => app.listen(0, "127.0.0.1", resolve));
+    const { port } = app.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}`;
+
+    const context = await browser.newContext({
+      viewport: VIEWPORT,
+      locale: "he-IL",
+      permissions: ["clipboard-read", "clipboard-write"],
+      origin: base,
+    } as Parameters<typeof browser.newContext>[0]);
+    const page = await context.newPage();
+
+    try {
+      await page.goto(base);
+      await submitAndWait(page, YOAV_EPISODE_URL, "#transcript-text");
+
+      const shown = (await page.textContent("#transcript-text")) ?? "";
+      expect(shown.length).toBeGreaterThan(0);
+
+      await page.click("#copy");
+      // The button confirms in Hebrew only after the write resolves.
+      await page.waitForFunction(
+        () => document.querySelector("#copy")?.textContent?.trim() === "הועתק",
+        undefined,
+        { timeout: 10_000 },
+      );
+
+      const clipboard = await page.evaluate(() => navigator.clipboard.readText());
+      expect(clipboard).toBe(shown);
+    } finally {
+      await context.close();
+      await new Promise<void>((resolve) => app.close(() => resolve()));
+    }
+  }, 60_000);
+
+  it("downloads the transcript as a text file", async () => {
+    await withPage(transcriptionScenario(), async (page, base) => {
+      await page.goto(base);
+      await submitAndWait(page, YOAV_EPISODE_URL, "#transcript-text");
+
+      const shown = (await page.textContent("#transcript-text")) ?? "";
+      const href = await page.getAttribute("a[download]", "href");
+      expect(href).toMatch(/^\/jobs\/.+\/transcript\.txt$/);
+
+      // Fetch it the way the browser would, and check what actually arrives.
+      const response = await page.request.get(`${base}${href ?? ""}`);
+      expect(response.status()).toBe(200);
+      expect(response.headers()["content-disposition"]).toContain("attachment");
+      expect(response.headers()["content-type"]).toContain("charset=utf-8");
+      expect(await response.text()).toBe(shown);
+    });
+  }, 60_000);
+});
+
+describe("gate screens at 360 px", () => {
+  it("renders the login screen right-to-left", async () => {
+    const app = createApp({
+      deps: transcriptionScenario(),
+      auth: new OwnerAuth("token-for-screenshot", "secret"),
+    });
+    await new Promise<void>((resolve) => app.listen(0, "127.0.0.1", resolve));
+    const { port } = app.address() as AddressInfo;
+
+    const context = await browser.newContext({ viewport: VIEWPORT, locale: "he-IL" });
+    const page = await context.newPage();
+    try {
+      await page.goto(`http://127.0.0.1:${port}/login`);
+      expect(await page.getAttribute("html", "dir")).toBe("rtl");
+      await assertNoHorizontalOverflow(page);
+      await page.screenshot({ path: `${SHOTS}/360-login.png`, fullPage: true });
+    } finally {
+      await context.close();
+      await new Promise<void>((resolve) => app.close(() => resolve()));
+    }
+  }, 60_000);
+
+  it("renders the missing-configuration screen with names only", async () => {
+    const app = createApp({
+      deps: transcriptionScenario(),
+      auth: null,
+      missingConfig: ["OWNER_ACCESS_TOKEN", "TRANSCRIPTION_API_KEY", "SUMMARY_API_KEY"],
+    });
+    await new Promise<void>((resolve) => app.listen(0, "127.0.0.1", resolve));
+    const { port } = app.address() as AddressInfo;
+
+    const context = await browser.newContext({ viewport: VIEWPORT, locale: "he-IL" });
+    const page = await context.newPage();
+    try {
+      await page.goto(`http://127.0.0.1:${port}/`);
+      expect(await page.textContent("body")).toContain("TRANSCRIPTION_API_KEY");
+      await assertNoHorizontalOverflow(page);
+      await page.screenshot({ path: `${SHOTS}/360-setup.png`, fullPage: true });
+    } finally {
+      await context.close();
+      await new Promise<void>((resolve) => app.close(() => resolve()));
+    }
+  }, 60_000);
 });

@@ -1,4 +1,7 @@
 import { SafeFetchError, safeFetchText } from "./http/safe-fetch.js";
+import { SummaryProviderError } from "./summary/llm-summarizer.js";
+import { TranscriptionProviderError } from "./transcription/openai-adapter.js";
+import { TranscriptionNotConfiguredError } from "./transcription/types.js";
 import { downloadAudio } from "./media/download.js";
 import { FfmpegAudioTool, type AudioTool } from "./media/ffmpeg.js";
 import { transcribeAudioFile } from "./media/transcribe-audio.js";
@@ -35,7 +38,13 @@ export type PipelineOutcome =
       summary: SummaryResult;
     }
   | { status: "ambiguous"; reason: string; feedUrl: string; candidates: ScoredCandidate[] }
-  | { status: "failed"; reason: ResolutionFailure | "no_audio" | "transcript_unavailable" | "queue_full"; detail: string };
+  | { status: "failed"; reason:
+        | ResolutionFailure
+        | "no_audio"
+        | "transcript_unavailable"
+        | "queue_full"
+        | "not_configured"
+        | "provider_failed"; detail: string };
 
 /**
  * Spotify URL to Hebrew transcript and summary.
@@ -54,13 +63,38 @@ export async function runPipeline(input: string, deps: PipelineDeps): Promise<Pi
   if ("failure" in transcript) return transcript.failure;
 
   deps.onPhase?.("summarizing");
-  const summary = await deps.summarizer.summarize({
-    transcript: transcript.text,
-    episodeTitle: evidence.episodeTitle,
-    language: TRANSCRIPTION_LANGUAGE,
-  });
+  let summary;
+  try {
+    summary = await deps.summarizer.summarize({
+      transcript: transcript.text,
+      episodeTitle: evidence.episodeTitle,
+      language: TRANSCRIPTION_LANGUAGE,
+    });
+  } catch (error) {
+    return providerFailure(error);
+  }
 
   return { status: "done", evidence, transcript, summary };
+}
+
+/**
+ * Map a provider problem onto a user-facing failure.
+ *
+ * The detail keeps the status and the provider's own message for diagnosis; it
+ * never carries the API key, the transcript, or the enclosure URL.
+ */
+function providerFailure(error: unknown): Extract<PipelineOutcome, { status: "failed" }> {
+  if (error instanceof TranscriptionNotConfiguredError) {
+    return { status: "failed", reason: "not_configured", detail: error.message };
+  }
+  if (error instanceof TranscriptionProviderError || error instanceof SummaryProviderError) {
+    return { status: "failed", reason: "provider_failed", detail: error.message };
+  }
+  return {
+    status: "failed",
+    reason: "provider_failed",
+    detail: error instanceof Error ? error.message : String(error),
+  };
 }
 
 async function obtainTranscript(
@@ -110,6 +144,13 @@ async function obtainTranscript(
 }
 
 function transcriptFailure(error: unknown): Extract<PipelineOutcome, { status: "failed" }> {
+  if (
+    error instanceof TranscriptionNotConfiguredError ||
+    error instanceof TranscriptionProviderError ||
+    error instanceof SummaryProviderError
+  ) {
+    return providerFailure(error);
+  }
   if (error instanceof SafeFetchError) {
     const blocked =
       error.reason === "blocked_host" ||
@@ -156,10 +197,14 @@ export async function completeChosenEpisode(
   const transcript = await obtainTranscript(evidence, evidence.transcriptUrl, deps);
   if ("failure" in transcript) return transcript.failure;
 
-  const summary = await deps.summarizer.summarize({
-    transcript: transcript.text,
-    episodeTitle: evidence.episodeTitle,
-    language: TRANSCRIPTION_LANGUAGE,
-  });
-  return { status: "done", evidence, transcript, summary };
+  try {
+    const summary = await deps.summarizer.summarize({
+      transcript: transcript.text,
+      episodeTitle: evidence.episodeTitle,
+      language: TRANSCRIPTION_LANGUAGE,
+    });
+    return { status: "done", evidence, transcript, summary };
+  } catch (error) {
+    return providerFailure(error);
+  }
 }

@@ -7,32 +7,96 @@ import {
   renderAmbiguous,
   renderError,
   renderHome,
+  renderLogin,
   renderProgress,
   renderResult,
+  renderSetup,
 } from "../ui/render.js";
+import { clearedCookie, OwnerAuth, readCookie, SESSION_COOKIE, sessionCookie } from "./auth.js";
 
 export interface AppOptions {
   deps: PipelineDeps;
   queue?: JobQueue;
+  /** Omit to run without authentication; only tests and local checks do that. */
+  auth?: OwnerAuth | null;
+  /** Variable names still missing. Non-empty means the setup screen replaces the app. */
+  missingConfig?: readonly string[];
+  /** Set when served over HTTPS so the session cookie is marked Secure. */
+  secureCookies?: boolean;
 }
 
 const MAX_BODY_BYTES = 8 * 1024;
 
-export function createApp({ deps, queue = new JobQueue() }: AppOptions): Server {
+export function createApp({
+  deps,
+  queue = new JobQueue(),
+  auth = null,
+  missingConfig = [],
+  secureCookies = false,
+}: AppOptions): Server {
+  const context: RequestContext = { deps, queue, auth, missingConfig, secureCookies };
   return createServer((req, res) => {
-    handle(req, res, deps, queue).catch(() => {
+    handle(req, res, context).catch(() => {
       send(res, 500, renderError({ status: "failed", reason: "no_match", detail: "internal" }));
     });
   });
 }
 
+interface RequestContext {
+  deps: PipelineDeps;
+  queue: JobQueue;
+  auth: OwnerAuth | null;
+  missingConfig: readonly string[];
+  secureCookies: boolean;
+}
+
 async function handle(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: PipelineDeps,
-  queue: JobQueue,
+  context: RequestContext,
 ): Promise<void> {
+  const { deps, queue, auth } = context;
   const path = new URL(req.url ?? "/", "http://localhost").pathname;
+
+  // An unconfigured deployment shows the setup screen instead of the app, so it
+  // can never be mistaken for a working one.
+  if (context.missingConfig.length > 0) {
+    return send(res, 503, renderSetup(context.missingConfig));
+  }
+
+  if (auth) {
+    if (req.method === "GET" && path === "/login") return send(res, 200, renderLogin());
+
+    if (req.method === "POST" && path === "/login") {
+      const form = await readForm(req);
+      if (!auth.verifyToken(form.get("token") ?? "")) {
+        return send(res, 401, renderLogin(true));
+      }
+      res.writeHead(303, {
+        location: "/",
+        "set-cookie": sessionCookie(auth.issueSession(), context.secureCookies),
+      });
+      res.end();
+      return;
+    }
+
+    if (req.method === "POST" && path === "/logout") {
+      res.writeHead(303, { location: "/login", "set-cookie": clearedCookie(context.secureCookies) });
+      res.end();
+      return;
+    }
+
+    if (!auth.verifySession(readCookie(req.headers.cookie, SESSION_COOKIE))) {
+      // 401 rather than a silent redirect, so an unauthorized request is
+      // unambiguous to a client and to the tests.
+      res.writeHead(401, {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+      });
+      res.end(renderLogin());
+      return;
+    }
+  }
 
   if (req.method === "GET" && path === "/") return send(res, 200, renderHome());
 

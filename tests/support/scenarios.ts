@@ -1,3 +1,5 @@
+import { writeFile } from "node:fs/promises";
+
 import type { AudioTool } from "../../src/media/ffmpeg.js";
 import { FixtureSummarizer } from "../../src/summary/fixture-summarizer.js";
 import { FixtureTranscriptionAdapter } from "../../src/transcription/fixture-adapter.js";
@@ -31,14 +33,19 @@ export const CHUNK_COUNT = 4;
 
 export const fakeAudioTool: AudioTool = {
   probeDurationSeconds: () => Promise.resolve(2335),
-  split: (_path, workspace) =>
-    Promise.resolve(
-      Array.from({ length: CHUNK_COUNT }, (_unused, index) => ({
-        index,
-        path: workspace.path(`chunk-${String(index).padStart(5, "0")}.mp3`),
-        startSeconds: index * 600,
-      })),
-    ),
+  // Writes real files: the production adapter reads each chunk off disk, so
+  // fabricated paths would fail for a reason unrelated to what is under test.
+  split: async (_path, workspace) => {
+    const chunks = Array.from({ length: CHUNK_COUNT }, (_unused, index) => ({
+      index,
+      path: workspace.path(`chunk-${String(index).padStart(5, "0")}.mp3`),
+      startSeconds: index * 600,
+    }));
+    for (const chunk of chunks) {
+      await writeFile(chunk.path, `fake-audio-chunk-${chunk.index}`);
+    }
+    return chunks;
+  },
 };
 
 export const HEBREW_TRANSCRIPT =

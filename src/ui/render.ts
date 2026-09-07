@@ -230,6 +230,7 @@ ${evidenceCard(outcome.evidence, sourceLabel)}
 <a href="/jobs/${encodeURIComponent(jobId)}/transcript.txt" download><button type="button" class="secondary">${escapeHtml(HE.download)}</button></a>
 </section>
 <a href="/"><button type="button" class="secondary">${escapeHtml(HE.again)}</button></a>
+<form method="post" action="/logout"><button type="submit" class="secondary">${escapeHtml(HE.logout)}</button></form>
 <script>
 document.getElementById("copy")?.addEventListener("click", async (event) => {
   const button = event.currentTarget;
@@ -340,4 +341,35 @@ ${
 </section>
 <noscript><p class="meta">${escapeHtml(HE.workingBody)}</p></noscript>`,
     '<meta http-equiv="refresh" content="2">');
+}
+
+/** Login screen. Never states whether the token was close, only that it was wrong. */
+export function renderLogin(failed = false): string {
+  return layout(`
+${failed ? `<section class="card notice error"><p>${escapeHtml(HE.loginFailed)}</p></section>` : ""}
+<form class="card" method="post" action="/login">
+<h2>${escapeHtml(HE.loginTitle)}</h2>
+<p class="meta">${escapeHtml(HE.loginBody)}</p>
+<label for="token">${escapeHtml(HE.loginLabel)}</label>
+<input id="token" name="token" type="password" autocomplete="current-password" required>
+<button type="submit">${escapeHtml(HE.loginSubmit)}</button>
+</form>`);
+}
+
+/**
+ * Configuration screen.
+ *
+ * Lists variable names only. Values are never rendered, and the page is shown
+ * instead of the app rather than alongside it, so an unconfigured deployment
+ * cannot be mistaken for a working one.
+ */
+export function renderSetup(missing: readonly string[]): string {
+  const rows = missing.map((name) => `<li>${ltr(name)}</li>`).join("");
+  return layout(`
+<section class="card notice" aria-labelledby="setup">
+<h2 id="setup">${escapeHtml(HE.setupTitle)}</h2>
+<p>${escapeHtml(HE.setupBody)}</p>
+<ul>${rows}</ul>
+<p class="meta">${escapeHtml(HE.setupAuthNote)}</p>
+</section>`);
 }

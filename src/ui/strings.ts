@@ -42,6 +42,18 @@ export const HE = {
   phaseSummarizing: "מסכמים",
   queuePosition: "מקום בתור",
   chunkProgress: "קטע",
+
+  loginTitle: "כניסה",
+  loginBody: "האפליקציה פרטית. הזינו את קוד הגישה כדי להמשיך.",
+  loginLabel: "קוד גישה",
+  loginSubmit: "כניסה",
+  loginFailed: "קוד הגישה שגוי.",
+  logout: "יציאה",
+
+  setupTitle: "האפליקציה אינה מוגדרת",
+  setupBody:
+    "כדי להפעיל את השירות יש להגדיר את משתני הסביבה הבאים ולהפעיל מחדש. הערכים עצמם אינם מוצגים כאן ואינם נשמרים בקוד.",
+  setupAuthNote: "ללא קוד גישה האפליקציה חוסמת כל שימוש, כדי שלא תהיה פתוחה לכל אחד.",
 } as const;
 
 /** One Hebrew sentence per failure, plus what the person can do about it. */
@@ -77,6 +89,10 @@ export function failureMessage(reason: FailureReason): string {
       return "לא הצלחנו להשיג את התמלול של הפרק. נסו שוב מאוחר יותר.";
     case "queue_full":
       return "יש כרגע יותר מדי בקשות בתור. נסו שוב בעוד כמה דקות.";
+    case "not_configured":
+      return "שירות התמלול או הסיכום אינו מוגדר. יש להשלים את ההגדרות ולהפעיל מחדש.";
+    case "provider_failed":
+      return "ספק התמלול או הסיכום החזיר שגיאה. נסו שוב מאוחר יותר.";
     default:
       return "אירעה תקלה בלתי צפויה.";
   }
