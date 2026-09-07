@@ -4,7 +4,11 @@ services:
   - type: web
     name: podcast-transcribe
     runtime: docker
-    plan: starter
+    # Free compute for the initial live proof, by owner decision. Free
+    # instances sleep after inactivity and cold-start on the next request,
+    # which matters more here than usual: jobs and transcripts live in memory,
+    # so a sleep discards them exactly as a restart does.
+    plan: free
     region: frankfurt
     dockerfilePath: ./Dockerfile
     healthCheckPath: /healthz
