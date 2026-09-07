@@ -729,3 +729,117 @@ describe("IPv6 literals", () => {
     expect(pinned).toEqual([address]);
   });
 });
+
+describe("oversize abort against a real undici connection", () => {
+  /**
+   * The spy tests above cannot prove this: they never open a socket, so they
+   * cannot show that an endless body is actually cut off rather than left
+   * running until the network timeout. This uses a real local server, real
+   * undici, and a real pinned dispatcher.
+   */
+  it("aborts an endless oversized body promptly and closes the connection", async () => {
+    let connectionClosed = false;
+    let closeObserved: () => void = () => {};
+    const sawClose = new Promise<void>((resolve) => {
+      closeObserved = resolve;
+    });
+
+    let timer: NodeJS.Timeout | undefined;
+    const server = createServer((req, res) => {
+      req.on("close", () => {
+        connectionClosed = true;
+        closeObserved();
+      });
+      res.writeHead(200, { "content-type": "application/octet-stream" });
+      // Never ends, and never signals a length: only an abort stops it.
+      timer = setInterval(() => {
+        res.write("x".repeat(4096));
+      }, 5);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+
+    const started = Date.now();
+    try {
+      await expect(
+        safeFetch(
+          // A name, so the URL guard passes; the dispatcher pins it to loopback.
+          `http://pinned.invalid:${port}/endless`,
+          // A long deadline: if the abort worked, this is never reached.
+          { maxBytes: 8192, timeoutMs: 60_000 },
+          {
+            fetch: defaultFetch,
+            resolveHost: () => Promise.resolve(["93.184.216.34"]),
+            createDispatcher: () => createPinnedDispatcher("127.0.0.1"),
+          },
+        ),
+      ).rejects.toMatchObject({ reason: "response_too_large" });
+
+      const elapsed = Date.now() - started;
+      // Promptly, meaning the byte cap ended it rather than the 60 s deadline.
+      expect(elapsed).toBeLessThan(10_000);
+
+      await Promise.race([
+        sawClose,
+        new Promise((_resolve, reject) =>
+          setTimeout(() => reject(new Error("server never saw the connection close")), 10_000),
+        ),
+      ]);
+      expect(connectionClosed).toBe(true);
+    } finally {
+      if (timer) clearInterval(timer);
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }, 60_000);
+
+  it("releases the connection when the caller cancels a streamed body mid-read", async () => {
+    let connectionClosed = false;
+    let closeObserved: () => void = () => {};
+    const sawClose = new Promise<void>((resolve) => {
+      closeObserved = resolve;
+    });
+
+    let timer: NodeJS.Timeout | undefined;
+    const server = createServer((req, res) => {
+      req.on("close", () => {
+        connectionClosed = true;
+        closeObserved();
+      });
+      res.writeHead(200, { "content-type": "application/octet-stream" });
+      timer = setInterval(() => {
+        res.write("y".repeat(1024));
+      }, 5);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+
+    try {
+      const stream = await safeFetchStream(
+        `http://pinned.invalid:${port}/endless`,
+        { maxBytes: 10_000_000, timeoutMs: 60_000 },
+        {
+          fetch: defaultFetch,
+          resolveHost: () => Promise.resolve(["93.184.216.34"]),
+          createDispatcher: () => createPinnedDispatcher("127.0.0.1"),
+        },
+      );
+
+      // Read one chunk, then walk away while the body is still locked.
+      for await (const chunk of stream.body) {
+        expect(chunk.byteLength).toBeGreaterThan(0);
+        break;
+      }
+
+      await Promise.race([
+        sawClose,
+        new Promise((_resolve, reject) =>
+          setTimeout(() => reject(new Error("server never saw the connection close")), 10_000),
+        ),
+      ]);
+      expect(connectionClosed).toBe(true);
+    } finally {
+      if (timer) clearInterval(timer);
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }, 60_000);
+});

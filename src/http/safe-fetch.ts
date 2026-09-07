@@ -116,39 +116,61 @@ function bareHostname(url: URL): string {
  */
 interface DispatcherHandle {
   dispatcher: Dispatcher;
+  /** Graceful. Only for a response that was fully consumed. */
   close(): Promise<void>;
-  readonly closed: boolean;
+  /** Immediate. For every abnormal end: oversize, cancel, abandon, body error. */
+  destroy(): Promise<void>;
+  readonly released: boolean;
 }
 
 function ownDispatcher(dispatcher: Dispatcher): DispatcherHandle {
-  let closed = false;
+  let released = false;
+  const release = async (hard: boolean): Promise<void> => {
+    if (released) return;
+    released = true;
+    if (hard) {
+      try {
+        await dispatcher?.destroy?.();
+      } catch {
+        /* nothing further to do */
+      }
+      return;
+    }
+    try {
+      await dispatcher?.close?.();
+    } catch {
+      // A pool with in-flight work refuses a graceful close; drop it hard
+      // rather than leak it.
+      try {
+        await dispatcher?.destroy?.();
+      } catch {
+        /* nothing further to do */
+      }
+    }
+  };
+
   return {
     dispatcher,
-    get closed() {
-      return closed;
+    get released() {
+      return released;
     },
-    async close() {
-      if (closed) return;
-      closed = true;
-      try {
-        await dispatcher?.close?.();
-      } catch {
-        // A pool with in-flight work refuses a graceful close; drop it hard
-        // rather than leak it.
-        try {
-          await dispatcher?.destroy?.();
-        } catch {
-          /* nothing further to do */
-        }
-      }
-    },
+    close: () => release(false),
+    destroy: () => release(true),
   };
 }
 
-/** Drain and release a response body we are not going to hand to the caller. */
+/**
+ * Release a response body we are not handing to the caller.
+ *
+ * Only safe while nothing holds the reader lock: `body.cancel()` rejects with
+ * "ReadableStream is locked" once a reader exists, and swallowing that would
+ * leave the request running. A locked body is cancelled by whoever owns the
+ * reader instead.
+ */
 async function discard(response: Response): Promise<void> {
+  if (!response.body || response.body.locked) return;
   try {
-    await response.body?.cancel();
+    await response.body.cancel();
   } catch {
     /* already released */
   }
@@ -239,11 +261,16 @@ export async function safeFetchStream(
     const vettedAddress = await assertHostResolvesPublicly(bareHostname(check.url), resolveHost);
 
     const handle = ownDispatcher(makeDispatcher(vettedAddress));
+    // Cancelling an in-flight streamed body has to abort the request itself.
+    // Closing the pool gracefully would wait for that request instead of
+    // ending it, which is the opposite of what a byte-cap abort needs.
+    const aborter = new AbortController();
+
     let response: Response;
     try {
-      response = await requestWithTimeout(check.url, handle.dispatcher, options, deps);
+      response = await requestWithTimeout(check.url, handle.dispatcher, aborter, options, deps);
     } catch (error) {
-      await handle.close();
+      await handle.destroy();
       throw error;
     }
 
@@ -251,6 +278,7 @@ export async function safeFetchStream(
       const location = response.headers.get("location");
       await discard(response);
       await handle.close();
+      aborter.abort();
       if (!location) {
         throw new SafeFetchError(
           "redirect_without_location",
@@ -265,6 +293,7 @@ export async function safeFetchStream(
     if (!response.ok) {
       await discard(response);
       await handle.close();
+      aborter.abort();
       throw new SafeFetchError("http_error", `Request failed with status ${response.status}`);
     }
 
@@ -275,10 +304,13 @@ export async function safeFetchStream(
       status: response.status,
       contentType: response.headers.get("content-type"),
       declaredBytes: parseLength(response.headers.get("content-length")),
-      body: iterate(response, handle),
+      body: iterate(response, handle, aborter),
       cancel: async () => {
+        // Abort first: the socket must stop delivering bytes even when a
+        // reader holds the body lock and `discard` cannot touch it.
+        aborter.abort();
         await discard(response);
-        await handle.close();
+        await handle.destroy();
       },
     };
   }
@@ -325,13 +357,15 @@ async function assertHostResolvesPublicly(
 async function requestWithTimeout(
   url: URL,
   dispatcher: Dispatcher,
+  aborter: AbortController,
   options: SafeFetchOptions,
   deps: SafeFetchDeps,
 ): Promise<Response> {
   try {
     const init: RequestInit & { dispatcher?: Dispatcher } = {
       redirect: "manual",
-      signal: AbortSignal.timeout(options.timeoutMs),
+      // Either the deadline or an explicit cancellation ends the request.
+      signal: AbortSignal.any([AbortSignal.timeout(options.timeoutMs), aborter.signal]),
     };
     if (options.accept) init.headers = { accept: options.accept };
     init.dispatcher = dispatcher;
@@ -362,21 +396,45 @@ function parseLength(value: string | null): number | null {
  * consumer abandons the loop early (a `break` or a throw inside `for await`),
  * so the dispatcher is released on every way out of the stream.
  */
-async function* iterate(response: Response, handle: DispatcherHandle): AsyncIterable<Uint8Array> {
+async function* iterate(
+  response: Response,
+  handle: DispatcherHandle,
+  aborter: AbortController,
+): AsyncIterable<Uint8Array> {
   if (!response.body) {
     await handle.close();
     return;
   }
+
   const reader = response.body.getReader();
+  let completed = false;
   try {
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) return;
+      if (done) {
+        completed = true;
+        return;
+      }
       if (value) yield value;
     }
   } finally {
-    reader.releaseLock();
-    await handle.close();
+    if (completed) {
+      reader.releaseLock();
+      await handle.close();
+    } else {
+      // Abnormal end: oversize, a consumer that stopped early, or a read
+      // error. Cancel through the reader we own, since an outside
+      // `body.cancel()` would reject on the lock, then abort the request and
+      // drop the pool rather than waiting for it.
+      try {
+        await reader.cancel();
+      } catch {
+        /* already errored */
+      }
+      reader.releaseLock();
+      aborter.abort();
+      await handle.destroy();
+    }
   }
 }
 
