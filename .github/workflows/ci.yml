@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# The suite runs entirely against local fixtures and a local mock provider, so
+# no secrets and no paid APIs are involved.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: lint, type-check, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # Installed explicitly rather than relying on whatever the runner image
+      # ships, so the ffmpeg tests actually run instead of skipping.
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      - name: Boot the built server and check liveness
+        run: |
+          node dist/server/main.js &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:10000/healthz > /dev/null; then break; fi
+            sleep 1
+          done
+          test "$(curl -fsS http://127.0.0.1:10000/healthz)" = '{"status":"ok"}'
+          # Unconfigured, so the app itself must refuse rather than serve.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:10000/)" = "503"
+
+  container:
+    name: docker build and smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t podcast-transcribe:ci .
+
+      - name: Boot the container and check liveness
+        run: |
+          docker run -d --name app -p 10000:10000 podcast-transcribe:ci
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:10000/healthz > /dev/null; then break; fi
+            sleep 1
+          done
+          test "$(curl -fsS http://127.0.0.1:10000/healthz)" = '{"status":"ok"}'
+          # ffmpeg must be present in the runtime image, not just the builder.
+          docker exec app ffmpeg -version | head -1
+          docker exec app ffprobe -version | head -1
+          # Unconfigured: it must refuse to serve the app.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:10000/)" = "503"
+          docker logs app
+          docker rm -f app

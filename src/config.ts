@@ -14,12 +14,56 @@ export interface AppConfig {
 
 export interface ConfigReport {
   config: AppConfig;
+  /** Why the owner token was rejected, when it was. Never contains the token. */
+  tokenProblem: TokenProblem | null;
   /** Names of the variables that are missing. Never their values. */
   missing: {
     auth: string[];
     transcription: string[];
     summary: string[];
   };
+}
+
+/** Minimum owner token length. Short tokens are guessable once the app is reachable. */
+export const MIN_OWNER_TOKEN_LENGTH = 24;
+
+/**
+ * Tokens that must never protect a deployment.
+ *
+ * These are the values people actually leave in place: placeholders copied
+ * from documentation and the usual defaults. Rejecting them at configuration
+ * time means a guessable deployment refuses to start rather than starting and
+ * looking fine.
+ */
+const FORBIDDEN_TOKENS = new Set([
+  "changeme",
+  "change-me",
+  "password",
+  "secret",
+  "token",
+  "admin",
+  "owner",
+  "test",
+  "example",
+  "your-token-here",
+  "owner_access_token",
+]);
+
+export type TokenProblem = "missing" | "too_short" | "forbidden" | "low_variety";
+
+/**
+ * Judge an owner token without ever echoing it.
+ *
+ * Length and character variety are crude proxies for entropy, but they reject
+ * the tokens that actually get used ("aaaaaaaa...", "password123") while
+ * accepting anything from a password manager or `openssl rand`.
+ */
+export function checkOwnerToken(token: string | null): TokenProblem | null {
+  if (!token) return "missing";
+  if (FORBIDDEN_TOKENS.has(token.toLowerCase())) return "forbidden";
+  if (token.length < MIN_OWNER_TOKEN_LENGTH) return "too_short";
+  if (new Set(token).size < 8) return "low_variety";
+  return null;
 }
 
 const DEFAULT_TRANSCRIPTION_BASE = "https://api.openai.com/v1";
@@ -91,7 +135,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ConfigReport {
     "gpt-4o-mini",
   );
 
-  const ownerAccessToken = read(env, "OWNER_ACCESS_TOKEN");
+  const rawToken = read(env, "OWNER_ACCESS_TOKEN");
+  const tokenProblem = checkOwnerToken(rawToken);
+  // A token that fails the check is treated as absent, so the app refuses to
+  // serve rather than running with protection that would not hold.
+  const ownerAccessToken = tokenProblem === null ? rawToken : null;
   const sessionSecret = read(env, "SESSION_SECRET") ?? ownerAccessToken;
 
   return {
@@ -102,6 +150,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ConfigReport {
       transcription: transcription.provider,
       summary: summary.provider,
     },
+    tokenProblem,
     missing: {
       auth: ownerAccessToken ? [] : ["OWNER_ACCESS_TOKEN"],
       transcription: transcription.missing,

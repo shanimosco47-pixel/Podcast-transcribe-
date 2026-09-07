@@ -49,6 +49,8 @@ export const HE = {
   loginSubmit: "כניסה",
   loginFailed: "קוד הגישה שגוי.",
   logout: "יציאה",
+  loginLocked: "יותר מדי ניסיונות כניסה. נסו שוב בעוד",
+  loginLockedUnit: "שניות.",
 
   setupTitle: "האפליקציה אינה מוגדרת",
   setupBody:

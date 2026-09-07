@@ -91,3 +91,49 @@ export function readCookie(header: string | undefined, name: string): string | u
   }
   return undefined;
 }
+
+/**
+ * Bounded login attempts for a single-user deployment.
+ *
+ * There are no accounts, so there is nothing to enumerate and no per-user
+ * state to keep: one counter covers the whole app. That is the right shape
+ * here, and it also means a lockout message cannot reveal whether any
+ * particular token or user exists.
+ */
+export class LoginLimiter {
+  private failures: number[] = [];
+
+  constructor(
+    private readonly maxAttempts = 8,
+    private readonly windowMs = 15 * 60 * 1000,
+  ) {}
+
+  /** True when further attempts are refused. */
+  isLocked(now = Date.now()): boolean {
+    this.prune(now);
+    return this.failures.length >= this.maxAttempts;
+  }
+
+  /** Seconds until the window frees up, for the Hebrew message. */
+  retryAfterSeconds(now = Date.now()): number {
+    this.prune(now);
+    const oldest = this.failures[0];
+    if (oldest === undefined) return 0;
+    return Math.max(1, Math.ceil((oldest + this.windowMs - now) / 1000));
+  }
+
+  recordFailure(now = Date.now()): void {
+    this.prune(now);
+    this.failures.push(now);
+  }
+
+  /** A correct token clears the record, so one bad day does not linger. */
+  recordSuccess(): void {
+    this.failures = [];
+  }
+
+  private prune(now: number): void {
+    const cutoff = now - this.windowMs;
+    this.failures = this.failures.filter((at) => at > cutoff);
+  }
+}

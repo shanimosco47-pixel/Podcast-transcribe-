@@ -1,0 +1,36 @@
+# Render blueprint. Deploying from it is the owner's decision, not an automatic
+# consequence of this file existing.
+services:
+  - type: web
+    name: podcast-transcribe
+    runtime: docker
+    plan: starter
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    autoDeploy: false
+    envVars:
+      # TLS terminates at Render, so the session cookie is marked Secure.
+      - key: TRUST_PROXY_TLS
+        value: "1"
+      # Every value below is set in the Render dashboard, never in this file.
+      # The app refuses to serve until the owner token and provider keys exist.
+      - key: OWNER_ACCESS_TOKEN
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: TRANSCRIPTION_API_KEY
+        sync: false
+      - key: TRANSCRIPTION_BASE_URL
+        sync: false
+      - key: TRANSCRIPTION_MODEL
+        sync: false
+      - key: SUMMARY_API_KEY
+        sync: false
+      - key: SUMMARY_BASE_URL
+        sync: false
+      - key: SUMMARY_MODEL
+        sync: false
+# No disk is attached. Jobs and transcripts live in memory for the life of the
+# process and are lost on restart, which is deliberate: adding a paid disk, or
+# storing transcripts permanently, is the owner's call.

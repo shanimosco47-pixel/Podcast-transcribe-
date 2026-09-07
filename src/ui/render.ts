@@ -343,8 +343,22 @@ ${
     '<meta http-equiv="refresh" content="2">');
 }
 
-/** Login screen. Never states whether the token was close, only that it was wrong. */
-export function renderLogin(failed = false): string {
+/**
+ * Login screen.
+ *
+ * The failure message is identical for every wrong token and says nothing
+ * about length, prefix or whether anything exists. When locked out, the form
+ * is not rendered at all.
+ */
+export function renderLogin(failed = false, lockedForSeconds = 0): string {
+  if (lockedForSeconds > 0) {
+    return layout(`
+<section class="card notice error">
+<h2>${escapeHtml(HE.loginTitle)}</h2>
+<p>${escapeHtml(HE.loginLocked)} ${lockedForSeconds} ${escapeHtml(HE.loginLockedUnit)}</p>
+</section>`);
+  }
+
   return layout(`
 ${failed ? `<section class="card notice error"><p>${escapeHtml(HE.loginFailed)}</p></section>` : ""}
 <form class="card" method="post" action="/login">

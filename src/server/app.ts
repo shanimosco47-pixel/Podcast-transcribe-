@@ -12,7 +12,14 @@ import {
   renderResult,
   renderSetup,
 } from "../ui/render.js";
-import { clearedCookie, OwnerAuth, readCookie, SESSION_COOKIE, sessionCookie } from "./auth.js";
+import {
+  clearedCookie,
+  LoginLimiter,
+  OwnerAuth,
+  readCookie,
+  SESSION_COOKIE,
+  sessionCookie,
+} from "./auth.js";
 
 export interface AppOptions {
   deps: PipelineDeps;
@@ -23,6 +30,8 @@ export interface AppOptions {
   missingConfig?: readonly string[];
   /** Set when served over HTTPS so the session cookie is marked Secure. */
   secureCookies?: boolean;
+  /** Bounded login attempts. Supplied by tests to control the window. */
+  loginLimiter?: LoginLimiter;
 }
 
 const MAX_BODY_BYTES = 8 * 1024;
@@ -33,8 +42,16 @@ export function createApp({
   auth = null,
   missingConfig = [],
   secureCookies = false,
+  loginLimiter = new LoginLimiter(),
 }: AppOptions): Server {
-  const context: RequestContext = { deps, queue, auth, missingConfig, secureCookies };
+  const context: RequestContext = {
+    deps,
+    queue,
+    auth,
+    missingConfig,
+    secureCookies,
+    loginLimiter,
+  };
   return createServer((req, res) => {
     handle(req, res, context).catch(() => {
       send(res, 500, renderError({ status: "failed", reason: "no_match", detail: "internal" }));
@@ -48,6 +65,7 @@ interface RequestContext {
   auth: OwnerAuth | null;
   missingConfig: readonly string[];
   secureCookies: boolean;
+  loginLimiter: LoginLimiter;
 }
 
 async function handle(
@@ -58,6 +76,20 @@ async function handle(
   const { deps, queue, auth } = context;
   const path = new URL(req.url ?? "/", "http://localhost").pathname;
 
+  // Liveness only, and deliberately so. It answers before authentication and
+  // before the configuration gate so a platform can health-check an
+  // unconfigured instance, and it reports nothing beyond "the process is
+  // answering": readiness would disclose configuration state to an
+  // unauthenticated caller.
+  if (req.method === "GET" && path === "/healthz") {
+    res.writeHead(200, {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    });
+    res.end('{"status":"ok"}');
+    return;
+  }
+
   // An unconfigured deployment shows the setup screen instead of the app, so it
   // can never be mistaken for a working one.
   if (context.missingConfig.length > 0) {
@@ -65,13 +97,28 @@ async function handle(
   }
 
   if (auth) {
-    if (req.method === "GET" && path === "/login") return send(res, 200, renderLogin());
+    if (req.method === "GET" && path === "/login") {
+      const locked = context.loginLimiter.isLocked();
+      return send(
+        res,
+        locked ? 429 : 200,
+        renderLogin(false, locked ? context.loginLimiter.retryAfterSeconds() : 0),
+      );
+    }
 
     if (req.method === "POST" && path === "/login") {
+      // Checked before the token is compared, so a locked-out caller learns
+      // nothing about whether the value they sent was right.
+      if (context.loginLimiter.isLocked()) {
+        return send(res, 429, renderLogin(false, context.loginLimiter.retryAfterSeconds()));
+      }
+
       const form = await readForm(req);
       if (!auth.verifyToken(form.get("token") ?? "")) {
+        context.loginLimiter.recordFailure();
         return send(res, 401, renderLogin(true));
       }
+      context.loginLimiter.recordSuccess();
       res.writeHead(303, {
         location: "/",
         "set-cookie": sessionCookie(auth.issueSession(), context.secureCookies),
