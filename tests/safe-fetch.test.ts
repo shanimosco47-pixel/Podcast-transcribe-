@@ -9,6 +9,7 @@ import {
   safeFetch,
   SafeFetchError,
   pinnedLookup,
+  safeFetchStream,
   safeFetchText,
 } from "../src/http/safe-fetch.js";
 import { isBlockedAddress } from "../src/http/url-guard.js";
@@ -457,5 +458,274 @@ describe("pinned connection against a real socket", () => {
     // Node's global fetch is a separate internal undici copy and rejects a
     // dispatcher from the undici package; production must not use it here.
     expect(defaultFetch).not.toBe(globalThis.fetch);
+  });
+});
+
+describe("dispatcher lifecycle", () => {
+  /** Stands in for an undici Agent and records how it was released. */
+  function dispatcherSpy() {
+    const created: { address: string; closed: boolean; destroyed: boolean }[] = [];
+    const create = (address: string) => {
+      const record = { address, closed: false, destroyed: false };
+      created.push(record);
+      return {
+        close: () => {
+          record.closed = true;
+          return Promise.resolve();
+        },
+        destroy: () => {
+          record.destroyed = true;
+          return Promise.resolve();
+        },
+      } as never;
+    };
+    return { created, create };
+  }
+
+  const allReleased = (created: { closed: boolean; destroyed: boolean }[]): boolean =>
+    created.every((entry) => entry.closed || entry.destroyed);
+
+  it("releases the dispatcher after a buffered response is consumed", async () => {
+    const spy = dispatcherSpy();
+    const script = scriptedFetch({
+      "https://cdn.example.com/x": () => new Response("body", { status: 200 }),
+    });
+
+    await safeFetchText("https://cdn.example.com/x", BASE, {
+      fetch: script.fetch,
+      resolveHost: PUBLIC_DNS,
+      createDispatcher: spy.create,
+    });
+
+    expect(spy.created).toHaveLength(1);
+    expect(allReleased(spy.created)).toBe(true);
+  });
+
+  it("releases every hop's dispatcher across a redirect chain", async () => {
+    const spy = dispatcherSpy();
+    const script = scriptedFetch({
+      "https://a.example.com/1": redirectTo("https://b.example.com/2"),
+      "https://b.example.com/2": redirectTo("https://c.example.com/3"),
+      "https://c.example.com/3": () => new Response("done", { status: 200 }),
+    });
+
+    await safeFetchText("https://a.example.com/1", BASE, {
+      fetch: script.fetch,
+      resolveHost: PUBLIC_DNS,
+      createDispatcher: spy.create,
+    });
+
+    expect(spy.created).toHaveLength(3);
+    expect(allReleased(spy.created)).toBe(true);
+  });
+
+  it("releases the dispatcher when the response is an HTTP error", async () => {
+    const spy = dispatcherSpy();
+    const script = scriptedFetch({
+      "https://cdn.example.com/x": () => new Response("nope", { status: 500 }),
+    });
+
+    await expect(
+      safeFetch("https://cdn.example.com/x", BASE, {
+        fetch: script.fetch,
+        resolveHost: PUBLIC_DNS,
+        createDispatcher: spy.create,
+      }),
+    ).rejects.toMatchObject({ reason: "http_error" });
+
+    expect(allReleased(spy.created)).toBe(true);
+  });
+
+  it("releases the dispatcher when the request itself throws", async () => {
+    const spy = dispatcherSpy();
+    const impl = (() => {
+      const error = new Error("timed out");
+      error.name = "TimeoutError";
+      return Promise.reject(error);
+    }) as typeof fetch;
+
+    await expect(
+      safeFetch("https://cdn.example.com/x", BASE, {
+        fetch: impl,
+        resolveHost: PUBLIC_DNS,
+        createDispatcher: spy.create,
+      }),
+    ).rejects.toMatchObject({ reason: "timeout" });
+
+    expect(spy.created).toHaveLength(1);
+    expect(allReleased(spy.created)).toBe(true);
+  });
+
+  it("releases the dispatcher when the body exceeds the byte cap", async () => {
+    const spy = dispatcherSpy();
+    const script = scriptedFetch({
+      "https://cdn.example.com/big": () => new Response("z".repeat(5000), { status: 200 }),
+    });
+
+    await expect(
+      safeFetch(
+        "https://cdn.example.com/big",
+        { ...BASE, maxBytes: 100 },
+        { fetch: script.fetch, resolveHost: PUBLIC_DNS, createDispatcher: spy.create },
+      ),
+    ).rejects.toMatchObject({ reason: "response_too_large" });
+
+    expect(allReleased(spy.created)).toBe(true);
+  });
+
+  it("releases the dispatcher when the body errors mid-stream", async () => {
+    const spy = dispatcherSpy();
+    const failing = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.error(new Error("connection reset"));
+      },
+    });
+    const script = scriptedFetch({
+      "https://cdn.example.com/x": () => new Response(failing, { status: 200 }),
+    });
+
+    await expect(
+      safeFetch("https://cdn.example.com/x", BASE, {
+        fetch: script.fetch,
+        resolveHost: PUBLIC_DNS,
+        createDispatcher: spy.create,
+      }),
+    ).rejects.toThrow(/connection reset/);
+
+    expect(allReleased(spy.created)).toBe(true);
+  });
+
+  it("releases the dispatcher when the caller cancels a stream", async () => {
+    const spy = dispatcherSpy();
+    const script = scriptedFetch({
+      "https://cdn.example.com/x": () => new Response("body", { status: 200 }),
+    });
+
+    const stream = await safeFetchStream("https://cdn.example.com/x", BASE, {
+      fetch: script.fetch,
+      resolveHost: PUBLIC_DNS,
+      createDispatcher: spy.create,
+    });
+    expect(allReleased(spy.created)).toBe(false);
+
+    await stream.cancel();
+    expect(allReleased(spy.created)).toBe(true);
+  });
+
+  it("does not release the dispatcher before a returned stream finishes", async () => {
+    const spy = dispatcherSpy();
+    const script = scriptedFetch({
+      "https://cdn.example.com/x": () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array([1, 2, 3]));
+              controller.enqueue(new Uint8Array([4, 5, 6]));
+              controller.close();
+            },
+          }),
+          { status: 200 },
+        ),
+    });
+
+    const stream = await safeFetchStream("https://cdn.example.com/x", BASE, {
+      fetch: script.fetch,
+      resolveHost: PUBLIC_DNS,
+      createDispatcher: spy.create,
+    });
+
+    let chunks = 0;
+    let bytes = 0;
+    for await (const chunk of stream.body) {
+      chunks += 1;
+      bytes += chunk.byteLength;
+      // Still open while the caller is mid-body.
+      expect(allReleased(spy.created)).toBe(false);
+    }
+
+    expect(chunks).toBe(2);
+    expect(bytes).toBe(6);
+    expect(allReleased(spy.created)).toBe(true);
+  });
+
+  it("releases the dispatcher when the consumer abandons the stream early", async () => {
+    const spy = dispatcherSpy();
+    const script = scriptedFetch({
+      "https://cdn.example.com/x": () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array([1]));
+              controller.enqueue(new Uint8Array([2]));
+              controller.close();
+            },
+          }),
+          { status: 200 },
+        ),
+    });
+
+    const stream = await safeFetchStream("https://cdn.example.com/x", BASE, {
+      fetch: script.fetch,
+      resolveHost: PUBLIC_DNS,
+      createDispatcher: spy.create,
+    });
+
+    // Abandon after the first chunk.
+    for await (const chunk of stream.body) {
+      expect(chunk.byteLength).toBeGreaterThan(0);
+      break;
+    }
+
+    expect(allReleased(spy.created)).toBe(true);
+  });
+
+  it("falls back to destroy when a graceful close is refused", async () => {
+    const record = { closed: false, destroyed: false };
+    const script = scriptedFetch({
+      "https://cdn.example.com/x": () => new Response("body", { status: 200 }),
+    });
+
+    await safeFetchText("https://cdn.example.com/x", BASE, {
+      fetch: script.fetch,
+      resolveHost: PUBLIC_DNS,
+      createDispatcher: () =>
+        ({
+          close: () => {
+            record.closed = true;
+            return Promise.reject(new Error("requests in flight"));
+          },
+          destroy: () => {
+            record.destroyed = true;
+            return Promise.resolve();
+          },
+        }) as never,
+    });
+
+    expect(record.closed).toBe(true);
+    expect(record.destroyed).toBe(true);
+  });
+});
+
+describe("IPv6 literals", () => {
+  it("treats a bracketed public IPv6 literal as an address, not a hostname", async () => {
+    const pinned: string[] = [];
+    const address = "2606:2800:220:1:248:1893:25c8:1946";
+    const script = scriptedFetch({
+      [`https://[${address}]/x`]: () => new Response("ok", { status: 200 }),
+    });
+
+    const result = await safeFetchText(`https://[${address}]/x`, BASE, {
+      fetch: script.fetch,
+      // DNS must not be consulted for a literal; rejecting proves it was not.
+      resolveHost: () => Promise.reject(new Error("DNS must not be consulted")),
+      createDispatcher: (pinnedAddress) => {
+        pinned.push(pinnedAddress);
+        return { close: () => Promise.resolve() } as never;
+      },
+    });
+
+    expect(result.text).toBe("ok");
+    // Pinned without brackets, so it is usable as an address.
+    expect(pinned).toEqual([address]);
   });
 });

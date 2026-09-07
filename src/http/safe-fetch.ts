@@ -96,6 +96,64 @@ export function pinnedLookup(
 
 const DEFAULT_MAX_REDIRECTS = 5;
 
+/**
+ * `URL.hostname` keeps the brackets on an IPv6 literal ("[::1]"), so `isIP`
+ * reports 0 and the literal would be sent to DNS as a name. Strip them before
+ * any literal detection or pinning.
+ */
+function bareHostname(url: URL): string {
+  return url.hostname.replace(/^\[|\]$/g, "");
+}
+
+/**
+ * Owns one dispatcher for one hop.
+ *
+ * Every dispatcher `safeFetch` creates carries a connection pool, so one must
+ * be released on every exit path: redirect, HTTP error, abort, oversize, body
+ * error, and normal completion. Without this, repeated jobs accumulate pools
+ * and file descriptors until the process degrades. Closing is idempotent
+ * because several paths can race to release the same hop.
+ */
+interface DispatcherHandle {
+  dispatcher: Dispatcher;
+  close(): Promise<void>;
+  readonly closed: boolean;
+}
+
+function ownDispatcher(dispatcher: Dispatcher): DispatcherHandle {
+  let closed = false;
+  return {
+    dispatcher,
+    get closed() {
+      return closed;
+    },
+    async close() {
+      if (closed) return;
+      closed = true;
+      try {
+        await dispatcher?.close?.();
+      } catch {
+        // A pool with in-flight work refuses a graceful close; drop it hard
+        // rather than leak it.
+        try {
+          await dispatcher?.destroy?.();
+        } catch {
+          /* nothing further to do */
+        }
+      }
+    },
+  };
+}
+
+/** Drain and release a response body we are not going to hand to the caller. */
+async function discard(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    /* already released */
+  }
+}
+
 async function defaultResolveHost(hostname: string): Promise<string[]> {
   const records = await lookup(hostname, { all: true, verbatim: true });
   return records.map((record) => record.address);
@@ -169,6 +227,7 @@ export async function safeFetchStream(
   deps: SafeFetchDeps,
 ): Promise<SafeStream> {
   const resolveHost = deps.resolveHost ?? defaultResolveHost;
+  const makeDispatcher = deps.createDispatcher ?? createPinnedDispatcher;
   const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
 
   let current = rawUrl;
@@ -177,13 +236,21 @@ export async function safeFetchStream(
     if (!check.ok) {
       throw new SafeFetchError(check.reason, `Refused ${redact(current)}: ${check.reason}`);
     }
-    const vettedAddress = await assertHostResolvesPublicly(check.url.hostname, resolveHost);
+    const vettedAddress = await assertHostResolvesPublicly(bareHostname(check.url), resolveHost);
 
-    const response = await requestWithTimeout(check.url, vettedAddress, options, deps);
+    const handle = ownDispatcher(makeDispatcher(vettedAddress));
+    let response: Response;
+    try {
+      response = await requestWithTimeout(check.url, handle.dispatcher, options, deps);
+    } catch (error) {
+      await handle.close();
+      throw error;
+    }
 
     if (isRedirect(response.status)) {
       const location = response.headers.get("location");
-      void response.body?.cancel();
+      await discard(response);
+      await handle.close();
       if (!location) {
         throw new SafeFetchError(
           "redirect_without_location",
@@ -196,18 +263,22 @@ export async function safeFetchStream(
     }
 
     if (!response.ok) {
-      void response.body?.cancel();
+      await discard(response);
+      await handle.close();
       throw new SafeFetchError("http_error", `Request failed with status ${response.status}`);
     }
 
+    // From here the caller owns the body, so the dispatcher outlives this
+    // function and is released when the body ends or the caller cancels.
     return {
       url: check.url.toString(),
       status: response.status,
       contentType: response.headers.get("content-type"),
       declaredBytes: parseLength(response.headers.get("content-length")),
-      body: iterate(response),
+      body: iterate(response, handle),
       cancel: async () => {
-        await response.body?.cancel().catch(() => undefined);
+        await discard(response);
+        await handle.close();
       },
     };
   }
@@ -253,7 +324,7 @@ async function assertHostResolvesPublicly(
 
 async function requestWithTimeout(
   url: URL,
-  vettedAddress: string,
+  dispatcher: Dispatcher,
   options: SafeFetchOptions,
   deps: SafeFetchDeps,
 ): Promise<Response> {
@@ -263,9 +334,7 @@ async function requestWithTimeout(
       signal: AbortSignal.timeout(options.timeoutMs),
     };
     if (options.accept) init.headers = { accept: options.accept };
-
-    const makeDispatcher = deps.createDispatcher ?? createPinnedDispatcher;
-    init.dispatcher = makeDispatcher(vettedAddress);
+    init.dispatcher = dispatcher;
 
     return await deps.fetch(url.toString(), init);
   } catch (error) {
@@ -286,8 +355,18 @@ function parseLength(value: string | null): number | null {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
-async function* iterate(response: Response): AsyncIterable<Uint8Array> {
-  if (!response.body) return;
+/**
+ * Yield the body, then release the hop's dispatcher.
+ *
+ * The `finally` runs on normal completion, on a read error, and when the
+ * consumer abandons the loop early (a `break` or a throw inside `for await`),
+ * so the dispatcher is released on every way out of the stream.
+ */
+async function* iterate(response: Response, handle: DispatcherHandle): AsyncIterable<Uint8Array> {
+  if (!response.body) {
+    await handle.close();
+    return;
+  }
   const reader = response.body.getReader();
   try {
     for (;;) {
@@ -297,6 +376,7 @@ async function* iterate(response: Response): AsyncIterable<Uint8Array> {
     }
   } finally {
     reader.releaseLock();
+    await handle.close();
   }
 }
 
