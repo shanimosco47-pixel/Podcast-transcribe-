@@ -5,7 +5,12 @@ import { describe, expect, it } from "vitest";
 
 import { defaultFetch } from "../src/http/safe-fetch.js";
 import { runPipeline } from "../src/pipeline.js";
-import { LlmSummarizer, parseSummaryJson, splitTranscript } from "../src/summary/llm-summarizer.js";
+import {
+  LlmSummarizer,
+  parseSummaryJson,
+  splitTranscript,
+  SummaryNotReducibleError,
+} from "../src/summary/llm-summarizer.js";
 import { renderError } from "../src/ui/render.js";
 import { NotConfiguredSummarizer } from "../src/summary/not-configured.js";
 import { NotConfiguredTranscriptionAdapter } from "../src/transcription/not-configured.js";
@@ -396,4 +401,115 @@ describe("splitTranscript", () => {
   it("returns one piece when the transcript fits", () => {
     expect(splitTranscript("קצר", 100)).toEqual(["קצר"]);
   });
+});
+
+describe("folding that never converges fails closed", () => {
+  /**
+   * A provider whose partial summaries are as long as their input. Folding can
+   * never shrink such output, so the run must fail rather than send an
+   * oversized final request or truncate the content away.
+   */
+  it("never exceeds the bound, and fails predictably instead", async () => {
+    const segmentChars = 1_500;
+    const provider = await startMockProvider({
+      // Each partial is longer than the bound on its own.
+      summaryFor: () => ({
+        summary: "ס".repeat(segmentChars),
+        keyPoints: ["נ".repeat(200)],
+      }),
+    });
+
+    try {
+      const summarizer = new LlmSummarizer(
+        { ...PROVIDER, baseUrl: provider.baseUrl, model: "gpt-4o-mini" },
+        defaultFetch,
+        segmentChars,
+      );
+
+      await expect(
+        summarizer.summarize({
+          transcript: Array.from({ length: 8 }, (_u, i) => `פסקה ${i} ${"מילה ".repeat(200)}`).join(
+            "\n\n",
+          ),
+          episodeTitle: "פרק שלא מתכווץ",
+          language: "he",
+        }),
+      ).rejects.toThrow(SummaryNotReducibleError);
+
+      // Every request that was issued stayed inside the bound.
+      for (const call of provider.summaries) {
+        expect(call.transcript.length).toBeLessThan(segmentChars + 500);
+      }
+      // It gave up rather than spinning: bounded rounds, not an endless loop.
+      expect(provider.summaries.length).toBeLessThan(60);
+    } finally {
+      await provider.close();
+    }
+  }, 60_000);
+
+  it("surfaces the non-convergent case as a provider failure, with no provider text", async () => {
+    const segmentChars = 300;
+    const provider = await startMockProvider({
+      // Long chunk transcripts, so the joined transcript exceeds the bound and
+      // the fold path is actually reached through the pipeline.
+      transcriptFor: () => "מילה ".repeat(120),
+      summaryFor: () => ({ summary: "ס".repeat(segmentChars), keyPoints: [] }),
+    });
+
+    try {
+      const scenario = transcriptionScenario();
+      const outcome = await runPipeline(YOAV_EPISODE_URL, {
+        ...scenario,
+        transcription: new OpenAiTranscriptionAdapter(
+          { ...PROVIDER, baseUrl: provider.baseUrl },
+          defaultFetch,
+        ),
+        summarizer: new LlmSummarizer(
+          { ...PROVIDER, baseUrl: provider.baseUrl, model: "gpt-4o-mini" },
+          defaultFetch,
+          segmentChars,
+        ),
+      });
+
+      expect(outcome.status).toBe("failed");
+      if (outcome.status !== "failed") return;
+      expect(outcome.reason).toBe("provider_failed");
+      // Only our own numbers, never a slice of what the provider returned.
+      expect(outcome.detail).toContain("folding rounds");
+      expect(outcome.detail).not.toContain("ס".repeat(50));
+    } finally {
+      await provider.close();
+    }
+  }, 60_000);
+
+  it("stops early when a fold round makes no progress", async () => {
+    const segmentChars = 1_000;
+    const provider = await startMockProvider({
+      summaryFor: () => ({ summary: "ס".repeat(segmentChars * 2), keyPoints: [] }),
+    });
+
+    try {
+      const summarizer = new LlmSummarizer(
+        { ...PROVIDER, baseUrl: provider.baseUrl, model: "gpt-4o-mini" },
+        defaultFetch,
+        segmentChars,
+      );
+      await expect(
+        summarizer.summarize({
+          transcript: Array.from({ length: 6 }, (_u, i) => `פסקה ${i} ${"מילה ".repeat(150)}`).join(
+            "\n\n",
+          ),
+          episodeTitle: "פרק",
+          language: "he",
+        }),
+      ).rejects.toThrow(SummaryNotReducibleError);
+
+      // Non-shrinking output is detected on the first fold, not after four.
+      const segmentsInFirstPass = Math.ceil(provider.summaries.length / 2);
+      expect(segmentsInFirstPass).toBeGreaterThan(0);
+      expect(provider.summaries.length).toBeLessThan(40);
+    } finally {
+      await provider.close();
+    }
+  }, 60_000);
 });

@@ -28,6 +28,29 @@ const SEGMENT_CHARS = 24_000;
 /** Guards against a pathological transcript folding forever. */
 const MAX_FOLD_ROUNDS = 4;
 
+/**
+ * Raised when folding cannot bring the partial summaries under the request
+ * bound.
+ *
+ * A provider is free to return partials as long as its input, in which case
+ * folding never converges. Failing here is deliberate: the alternatives are
+ * sending an oversized request, looping forever, or truncating, and truncating
+ * is the defect this whole path exists to remove. The message carries only our
+ * own numbers, never provider content.
+ */
+export class SummaryNotReducibleError extends Error {
+  constructor(
+    readonly rounds: number,
+    readonly chars: number,
+    readonly bound: number,
+  ) {
+    super(
+      `Summary could not be reduced below ${bound} characters after ${rounds} folding rounds (still ${chars})`,
+    );
+    this.name = "SummaryNotReducibleError";
+  }
+}
+
 const FINAL_PROMPT = [
   "אתה עוזר שמסכם פרקי פודקאסט בעברית.",
   "החזר JSON בלבד, במבנה:",
@@ -82,7 +105,9 @@ export class LlmSummarizer implements SummarizerAdapter {
     }
 
     // Fold until the combined partials fit one request.
-    for (let round = 0; round < MAX_FOLD_ROUNDS && joined(partials).length > this.segmentChars; round += 1) {
+    let rounds = 0;
+    while (joined(partials).length > this.segmentChars && rounds < MAX_FOLD_ROUNDS) {
+      const before = joined(partials).length;
       const groups = splitTranscript(joined(partials), this.segmentChars);
       const folded: string[] = [];
       for (const [index, group] of groups.entries()) {
@@ -93,12 +118,21 @@ export class LlmSummarizer implements SummarizerAdapter {
         folded.push(renderPartial(index, partial));
       }
       partials = folded;
+      rounds += 1;
+
+      // A round that did not shrink anything will not shrink on the next one
+      // either; stop rather than spending more provider calls on it.
+      if (joined(partials).length >= before) break;
     }
 
-    const result = await this.ask(
-      FINAL_PROMPT,
-      this.finalUser(request.episodeTitle, joined(partials), true),
-    );
+    // Fail closed. Reaching the final request with an oversized body would
+    // break the bound this whole path exists to hold.
+    const body = joined(partials);
+    if (body.length > this.segmentChars) {
+      throw new SummaryNotReducibleError(rounds, body.length, this.segmentChars);
+    }
+
+    const result = await this.ask(FINAL_PROMPT, this.finalUser(request.episodeTitle, body, true));
     return { ...result, provider: this.name };
   }
 

@@ -1,5 +1,5 @@
 import { SafeFetchError, safeFetchText } from "./http/safe-fetch.js";
-import { SummaryProviderError } from "./summary/llm-summarizer.js";
+import { SummaryNotReducibleError, SummaryProviderError } from "./summary/llm-summarizer.js";
 import { TranscriptionProviderError } from "./transcription/openai-adapter.js";
 import { TranscriptionNotConfiguredError } from "./transcription/types.js";
 import { downloadAudio } from "./media/download.js";
@@ -80,14 +80,19 @@ export async function runPipeline(input: string, deps: PipelineDeps): Promise<Pi
 /**
  * Map a provider problem onto a user-facing failure.
  *
- * The detail keeps the status and the provider's own message for diagnosis; it
- * never carries the API key, the transcript, or the enclosure URL.
+ * The detail keeps the HTTP status and a category we derive from it. The
+ * provider's response body is never read, so nothing it controls can reach the
+ * page or a log: not the API key, the transcript, or the enclosure URL.
  */
 function providerFailure(error: unknown): Extract<PipelineOutcome, { status: "failed" }> {
   if (error instanceof TranscriptionNotConfiguredError) {
     return { status: "failed", reason: "not_configured", detail: error.message };
   }
-  if (error instanceof TranscriptionProviderError || error instanceof SummaryProviderError) {
+  if (
+    error instanceof TranscriptionProviderError ||
+    error instanceof SummaryProviderError ||
+    error instanceof SummaryNotReducibleError
+  ) {
     return { status: "failed", reason: "provider_failed", detail: error.message };
   }
   return {
