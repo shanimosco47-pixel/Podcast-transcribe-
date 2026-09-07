@@ -16,6 +16,8 @@ export interface ConfigReport {
   config: AppConfig;
   /** Why the owner token was rejected, when it was. Never contains the token. */
   tokenProblem: TokenProblem | null;
+  /** Why an explicitly supplied session secret was rejected. Never contains it. */
+  secretProblem: TokenProblem | null;
   /** Names of the variables that are missing. Never their values. */
   missing: {
     auth: string[];
@@ -52,18 +54,22 @@ const FORBIDDEN_TOKENS = new Set([
 export type TokenProblem = "missing" | "too_short" | "forbidden" | "low_variety";
 
 /**
- * Judge an owner token without ever echoing it.
+ * Judge a secret's strength without ever echoing it.
  *
  * Length and character variety are crude proxies for entropy, but they reject
- * the tokens that actually get used ("aaaaaaaa...", "password123") while
+ * the values that actually get used ("aaaaaaaa...", "password123") while
  * accepting anything from a password manager or `openssl rand`.
  */
+export function checkSecretStrength(value: string): TokenProblem | null {
+  if (FORBIDDEN_TOKENS.has(value.toLowerCase())) return "forbidden";
+  if (value.length < MIN_OWNER_TOKEN_LENGTH) return "too_short";
+  if (new Set(value).size < 8) return "low_variety";
+  return null;
+}
+
 export function checkOwnerToken(token: string | null): TokenProblem | null {
   if (!token) return "missing";
-  if (FORBIDDEN_TOKENS.has(token.toLowerCase())) return "forbidden";
-  if (token.length < MIN_OWNER_TOKEN_LENGTH) return "too_short";
-  if (new Set(token).size < 8) return "low_variety";
-  return null;
+  return checkSecretStrength(token);
 }
 
 const DEFAULT_TRANSCRIPTION_BASE = "https://api.openai.com/v1";
@@ -140,7 +146,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ConfigReport {
   // A token that fails the check is treated as absent, so the app refuses to
   // serve rather than running with protection that would not hold.
   const ownerAccessToken = tokenProblem === null ? rawToken : null;
-  const sessionSecret = read(env, "SESSION_SECRET") ?? ownerAccessToken;
+
+  // The session secret signs the cookie that stands in for the token after
+  // login, so a weak secret makes signatures forgeable and defeats the token
+  // check entirely. An explicitly supplied secret is held to the same standard.
+  // When absent it falls back to the owner token, which was already validated.
+  const rawSecret = read(env, "SESSION_SECRET");
+  const secretProblem = rawSecret === null ? null : checkSecretStrength(rawSecret);
+  const sessionSecret =
+    secretProblem === null ? (rawSecret ?? ownerAccessToken) : null;
 
   return {
     config: {
@@ -151,8 +165,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ConfigReport {
       summary: summary.provider,
     },
     tokenProblem,
+    secretProblem,
     missing: {
-      auth: ownerAccessToken ? [] : ["OWNER_ACCESS_TOKEN"],
+      auth: [
+        ...(ownerAccessToken ? [] : ["OWNER_ACCESS_TOKEN"]),
+        // Named on its own, so a strong token with a weak secret points at the
+        // variable that actually needs changing.
+        ...(secretProblem === null ? [] : ["SESSION_SECRET"]),
+      ],
       transcription: transcription.missing,
       summary: summary.missing,
     },

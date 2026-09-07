@@ -386,3 +386,81 @@ describe("bounded login attempts", () => {
     expect(response.headers.get("set-cookie")).toContain("HttpOnly");
   });
 });
+
+describe("session secret strength", () => {
+  const STRONG_TOKEN = "Xk7-pQ2rL9vT4mB8nZ1cW6yH";
+
+  it.each([
+    ["a one-character secret", "x"],
+    ["a short secret", "abc123"],
+    ["a known placeholder", "changeme"],
+    ["low variety", "aaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+  ])("rejects %s even when the owner token is strong", (_label, secret) => {
+    const report = loadConfig({
+      OWNER_ACCESS_TOKEN: STRONG_TOKEN,
+      SESSION_SECRET: secret,
+      TRANSCRIPTION_API_KEY: "a",
+      SUMMARY_API_KEY: "b",
+    } as NodeJS.ProcessEnv);
+
+    // A forgeable cookie signature would bypass the token check entirely.
+    expect(report.secretProblem).not.toBeNull();
+    expect(report.config.sessionSecret).toBeNull();
+    expect(isFullyConfigured(report)).toBe(false);
+
+    // Only the variable that actually needs changing is named.
+    expect(report.missing.auth).toEqual(["SESSION_SECRET"]);
+  });
+
+  it("accepts a strong explicit secret", () => {
+    const report = loadConfig({
+      OWNER_ACCESS_TOKEN: STRONG_TOKEN,
+      SESSION_SECRET: "hK4$wR8-mV2pL6zQ9xB3nT7c",
+      TRANSCRIPTION_API_KEY: "a",
+      SUMMARY_API_KEY: "b",
+    } as NodeJS.ProcessEnv);
+
+    expect(report.secretProblem).toBeNull();
+    expect(report.config.sessionSecret).toBe("hK4$wR8-mV2pL6zQ9xB3nT7c");
+    expect(isFullyConfigured(report)).toBe(true);
+  });
+
+  it("falls back to the already-validated owner token when the variable is absent", () => {
+    const report = loadConfig({
+      OWNER_ACCESS_TOKEN: STRONG_TOKEN,
+      TRANSCRIPTION_API_KEY: "a",
+      SUMMARY_API_KEY: "b",
+    } as NodeJS.ProcessEnv);
+
+    expect(report.secretProblem).toBeNull();
+    expect(report.config.sessionSecret).toBe(STRONG_TOKEN);
+    expect(report.missing.auth).toEqual([]);
+  });
+
+  it("never echoes a rejected secret", () => {
+    const secret = "changeme";
+    const report = loadConfig({
+      OWNER_ACCESS_TOKEN: STRONG_TOKEN,
+      SESSION_SECRET: secret,
+    } as NodeJS.ProcessEnv);
+
+    expect(JSON.stringify(report) ).not.toContain(secret);
+  });
+
+  it("refuses to serve when only the secret is weak", async () => {
+    const report = loadConfig({
+      OWNER_ACCESS_TOKEN: STRONG_TOKEN,
+      SESSION_SECRET: "x",
+      TRANSCRIPTION_API_KEY: "a",
+      SUMMARY_API_KEY: "b",
+    } as NodeJS.ProcessEnv);
+
+    const base = await start({ auth: null, missingConfig: missingNames(report) });
+    const response = await fetch(base);
+
+    expect(response.status).toBe(503);
+    const html = await response.text();
+    expect(html).toContain("SESSION_SECRET");
+    expect(html).not.toContain("OWNER_ACCESS_TOKEN");
+  });
+});
