@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+     xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"
+     xmlns:podcast="https://podcastindex.org/namespace/1.0">
+  <channel>
+    <title>עושים טכנולוגיה</title>
+    <language>he</language>
+
+    <item>
+      <title>ריאיון עם דנה על בינה מלאכותית</title>
+      <pubDate>Mon, 02 Jun 2025 06:00:00 +0300</pubDate>
+      <itunes:duration>00:42:10</itunes:duration>
+      <enclosure url="https://cdn.example.com/audio/dana.mp3" type="audio/mpeg" length="40530000"/>
+    </item>
+
+    <item>
+      <title>ריאיון עם יואב על שבבים</title>
+      <pubDate>Mon, 09 Jun 2025 06:00:00 +0300</pubDate>
+      <itunes:duration>00:38:55</itunes:duration>
+      <enclosure url="https://cdn.example.com/audio/yoav.mp3" type="audio/mpeg" length="37380000"/>
+    </item>
+
+    <item>
+      <title>פרק 12: איך בונים מוצר</title>
+      <pubDate>Mon, 16 Jun 2025 06:00:00 +0300</pubDate>
+      <itunes:duration>00:51:03</itunes:duration>
+      <podcast:transcript url="https://cdn.example.com/transcripts/ep12.vtt" type="text/vtt" language="he"/>
+      <enclosure url="https://cdn.example.com/audio/ep12.mp3" type="audio/mpeg" length="49000000"/>
+    </item>
+  </channel>
+</rss>
